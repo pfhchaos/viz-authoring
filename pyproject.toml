@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "viz-authoring"
+version = "0.1.0"
+description = "Framework for building audio-reactive Wayland wallpaper visualizations — generic GPU/worker/load primitives extracted from flame-sheep"
+requires-python = ">=3.12"
+dependencies = [
+    "numpy>=2.0",
+    "moderngl>=5.0",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7.0"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
