@@ -88,8 +88,14 @@ class GraphicsPipeline:
                  topology: int = vk.VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
                  cull_mode: int = vk.VK_CULL_MODE_NONE,
                  storage_buffers: list | None = None,
+                 sampled_images: list | None = None,
                  push_constant_size: int = 0,
                  ):
+        # sampled_images: list of (VkImage, VkSampler) tuples. Bindings
+        # come after storage_buffers (so storage[0..N-1], samplers[N..]).
+        # Lets fragment shaders mix SSBO data + sampled textures in
+        # one descriptor set — what tonemap.frag needs (histogram +
+        # max as SSBOs, palette as sampler2D).
         self.ctx = ctx
         self.descriptor_set_layout = None
         self.descriptor_pool = None
@@ -155,19 +161,29 @@ class GraphicsPipeline:
             attachmentCount=1, pAttachments=[color_blend_attachment],
         )
 
-        # Optional descriptor set for storage buffers visible to the
-        # fragment stage (Phase 3 tonemap uses this).
+        # Optional descriptor set for storage buffers + sampled images
+        # visible to the fragment stage. One descriptor set holds all
+        # fragment-stage resources; bindings allocated in order
+        # (storage[0..N-1], samplers[N..N+M-1]).
         set_layouts = []
-        if storage_buffers:
-            ds_bindings = [
-                vk.VkDescriptorSetLayoutBinding(
+        sb_count = len(storage_buffers) if storage_buffers else 0
+        si_count = len(sampled_images) if sampled_images else 0
+        if sb_count + si_count > 0:
+            ds_bindings = []
+            for i in range(sb_count):
+                ds_bindings.append(vk.VkDescriptorSetLayoutBinding(
                     binding=i,
                     descriptorType=vk.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
                     descriptorCount=1,
                     stageFlags=vk.VK_SHADER_STAGE_FRAGMENT_BIT,
-                )
-                for i in range(len(storage_buffers))
-            ]
+                ))
+            for j in range(si_count):
+                ds_bindings.append(vk.VkDescriptorSetLayoutBinding(
+                    binding=sb_count + j,
+                    descriptorType=vk.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                    descriptorCount=1,
+                    stageFlags=vk.VK_SHADER_STAGE_FRAGMENT_BIT,
+                ))
             dsl_create = vk.VkDescriptorSetLayoutCreateInfo(
                 sType=vk.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
                 bindingCount=len(ds_bindings), pBindings=ds_bindings,
@@ -176,13 +192,21 @@ class GraphicsPipeline:
                 ctx.device, dsl_create, None)
             set_layouts = [self.descriptor_set_layout]
 
-            pool_size = vk.VkDescriptorPoolSize(
-                type=vk.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                descriptorCount=len(storage_buffers),
-            )
+            pool_sizes = []
+            if sb_count > 0:
+                pool_sizes.append(vk.VkDescriptorPoolSize(
+                    type=vk.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                    descriptorCount=sb_count,
+                ))
+            if si_count > 0:
+                pool_sizes.append(vk.VkDescriptorPoolSize(
+                    type=vk.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                    descriptorCount=si_count,
+                ))
             dp_create = vk.VkDescriptorPoolCreateInfo(
                 sType=vk.VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-                poolSizeCount=1, pPoolSizes=[pool_size], maxSets=1,
+                poolSizeCount=len(pool_sizes), pPoolSizes=pool_sizes,
+                maxSets=1,
             )
             self.descriptor_pool = vk.vkCreateDescriptorPool(
                 ctx.device, dp_create, None)
@@ -195,7 +219,7 @@ class GraphicsPipeline:
             self.descriptor_set = vk.vkAllocateDescriptorSets(
                 ctx.device, ds_alloc)[0]
             writes = []
-            for i, buf in enumerate(storage_buffers):
+            for i, buf in enumerate(storage_buffers or []):
                 bi = vk.VkDescriptorBufferInfo(
                     buffer=buf.buffer, offset=0, range=buf.size)
                 writes.append(vk.VkWriteDescriptorSet(
@@ -204,6 +228,20 @@ class GraphicsPipeline:
                     dstBinding=i, dstArrayElement=0, descriptorCount=1,
                     descriptorType=vk.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
                     pBufferInfo=[bi],
+                ))
+            for j, (image, sampler) in enumerate(sampled_images or []):
+                ii = vk.VkDescriptorImageInfo(
+                    sampler=sampler.sampler,
+                    imageView=image.view,
+                    imageLayout=vk.VK_IMAGE_LAYOUT_GENERAL,
+                )
+                writes.append(vk.VkWriteDescriptorSet(
+                    sType=vk.VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                    dstSet=self.descriptor_set,
+                    dstBinding=sb_count + j, dstArrayElement=0,
+                    descriptorCount=1,
+                    descriptorType=vk.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                    pImageInfo=[ii],
                 ))
             vk.vkUpdateDescriptorSets(
                 ctx.device, len(writes), writes, 0, None)

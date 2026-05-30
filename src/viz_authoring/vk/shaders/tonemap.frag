@@ -19,6 +19,11 @@ layout(std430, binding = 1) readonly buffer MaxBuf {
     uint max_hits;
 };
 
+// Palette texture: 256x1 RGBA (the alpha channel is ignored). Color
+// index ∈ [0,1] samples along U with linear filtering for smooth
+// gradients between palette entries.
+layout(set = 0, binding = 2) uniform sampler2D u_palette;
+
 layout(push_constant) uniform PushConstants {
     int width;
     int height;
@@ -26,19 +31,6 @@ layout(push_constant) uniform PushConstants {
 };
 
 #define COLOR_SCALE 1000000u
-
-// Tiny built-in palette: triadic spectrum (red→green→blue). Stand-in
-// for the GL version's 256-bin sampler2D palette — gets us to a visible
-// flame; real palette support lands in Phase 3.5.
-vec3 simple_palette(float t) {
-    t = clamp(t, 0.0, 1.0);
-    // Smooth blend across three primary colors at t=0/0.5/1.
-    vec3 c0 = vec3(1.0, 0.2, 0.05);   // warm red
-    vec3 c1 = vec3(0.05, 0.9, 0.4);   // green
-    vec3 c2 = vec3(0.1, 0.3, 1.0);    // blue
-    if (t < 0.5) return mix(c0, c1, t * 2.0);
-    else         return mix(c1, c2, (t - 0.5) * 2.0);
-}
 
 void main() {
     // Map UV → pixel coords in the histogram. UV [0,1]^2 covers the
@@ -70,6 +62,6 @@ void main() {
     // color_idx = color_acc / (hits * COLOR_SCALE)
     float color_idx = float(color) / (float(hits) * float(COLOR_SCALE));
     color_idx = clamp(color_idx, 0.0, 1.0);
-    vec3 rgb = simple_palette(color_idx) * alpha;
+    vec3 rgb = texture(u_palette, vec2(color_idx, 0.5)).rgb * alpha;
     frag_color = vec4(clamp(rgb, 0.0, 1.0), 1.0);
 }

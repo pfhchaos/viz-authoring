@@ -34,11 +34,36 @@ import vulkan as vk
 
 from .chaos_game import ChaosGame, MAX_TRANSFORMS, MAX_ACTIVE_VARS, SLOT_SIZE
 from .context import VkContext
+from .image import create_image_rgba8, upload_image_rgba8, create_linear_sampler
 from .pipeline import GraphicsPipeline, make_color_attachment_render_pass
 from .surface import WindowSurface
 from .swapchain import Swapchain
 
 SHADER_DIR = Path(__file__).parent / 'shaders'
+
+
+def _fire_palette() -> np.ndarray:
+    """256-entry fire palette: black → deep red → orange → yellow → white.
+    Stand-in for a real flame-sheep palette; matches the visual register
+    of the GL renderer's typical output well enough for Phase 3.5 demo
+    purposes."""
+    n = 256
+    rgba = np.zeros((1, n, 4), dtype=np.uint8)
+    for i in range(n):
+        t = i / (n - 1)
+        if t < 0.25:           # black → deep red
+            r = t * 4.0
+            rgba[0, i] = (int(r * 180), 0, 0, 255)
+        elif t < 0.55:         # deep red → orange
+            r = (t - 0.25) / 0.30
+            rgba[0, i] = (int(180 + r * 75), int(r * 120), 0, 255)
+        elif t < 0.85:         # orange → yellow
+            r = (t - 0.55) / 0.30
+            rgba[0, i] = (255, int(120 + r * 135), int(r * 100), 255)
+        else:                  # yellow → white
+            r = (t - 0.85) / 0.15
+            rgba[0, i] = (255, 255, int(100 + r * 155), 255)
+    return rgba
 
 
 def _sierpinski_genome():
@@ -97,13 +122,21 @@ class FlameDemo:
         self.chaos.set_genome(**(genome or _sierpinski_genome()))
         self.chaos.reset_walkers(seed=0)
 
-        # Tonemap graphics pipeline — reads histogram + max_buf.
+        # Palette texture — 256x1 RGBA image + linear-clamp sampler.
+        # The tonemap fragment shader samples it with color_idx ∈ [0,1].
+        self.palette_image = create_image_rgba8(self.ctx, 256, 1)
+        upload_image_rgba8(self.ctx, self.palette_image, _fire_palette())
+        self.palette_sampler = create_linear_sampler(self.ctx)
+
+        # Tonemap graphics pipeline — SSBOs (histogram, max_buf) + the
+        # palette sampler.
         self.tonemap = GraphicsPipeline(
             self.ctx, self.render_pass,
             SHADER_DIR / 'tonemap.vert',
             SHADER_DIR / 'tonemap.frag',
             extent=self.swapchain.extent,
             storage_buffers=[self.chaos.histogram, self.chaos.max_buf],
+            sampled_images=[(self.palette_image, self.palette_sampler)],
             push_constant_size=12,
         )
 
@@ -214,6 +247,10 @@ class FlameDemo:
                 vk.vkDestroyFence(self.ctx.device, self.in_flight, None)
             if hasattr(self, 'tonemap'):
                 self.tonemap.cleanup()
+            if hasattr(self, 'palette_image'):
+                self.palette_image.destroy()
+            if hasattr(self, 'palette_sampler'):
+                self.palette_sampler.destroy()
             if hasattr(self, 'chaos'):
                 self.chaos.cleanup()
             if hasattr(self, 'render_pass'):
