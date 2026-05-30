@@ -23,6 +23,7 @@ import struct
 from pathlib import Path
 
 import numpy as np
+import vulkan as vk
 
 from .pipeline import ComputePipeline
 
@@ -252,6 +253,130 @@ class ChaosGame:
         self.ctx.dispatch_compute(self._reduce_pipe, groups_x=groups,
                                     push_constants=push)
         return int(self.ctx.download(self.max_buf, np.uint32, 1)[0])
+
+    # -----------------------------------------------------------------
+    # Per-frame batched dispatch — clear + chaos + reduce_max in ONE
+    # command buffer with memory barriers between. Per-call cost was
+    # 3× fence-wait round-trips with the unbatched version, which on
+    # the wallpaper's busy frame pattern measured ~40 ms (vs the GL
+    # backend's much lower per-frame cost). Batching collapses the
+    # round-trips to one.
+    #
+    # We don't read max_buf from the GPU after this returns — the
+    # tonemap fragment shader reads it directly via its descriptor
+    # set, no CPU readback needed during a frame. The
+    # reduce_max_hits() method above is retained for callers that
+    # actually want the value back on the CPU.
+    # -----------------------------------------------------------------
+
+    def frame(self, iterations: int = 30,
+              zoom: tuple[float, float] = (1.0, 1.0),
+              rotation: float = 0.0,
+              center: tuple[float, float] = (0.0, 0.0),
+              decay: float = 0.0):
+        """Run the per-frame chaos-game cycle in a single command-buffer
+        submit:
+          1. clear / decay the histogram
+          2. n_walkers × `iterations` chaos game steps
+          3. reduce the histogram to a single max value in max_buf
+        Memory barriers between dispatches make the writes from the
+        prior dispatch visible to the next. Caller doesn't need to
+        wait — the next graphics submission already does (via the
+        usual presentation semaphore + fence).
+        """
+        import cffi
+        import math
+        ffi = cffi.FFI()
+
+        n_pixels = self.canvas_w * self.canvas_h
+        size = n_pixels * 2
+        # ---- precompute per-dispatch push constants -----------------
+        clear_push = struct.pack('3I', size, int(decay * 256), 0)
+        cos_r = math.cos(rotation); sin_r = math.sin(rotation)
+        chaos_push = struct.pack(
+            'i 4x 2f 2f 2f 4i I 2I',
+            self._n_transforms,
+            zoom[0], zoom[1],
+            cos_r, sin_r,
+            center[0], center[1],
+            self.canvas_w, self.canvas_h, iterations,
+            self._has_final_xform,
+            self._frame_seed, 0, n_pixels,
+        )
+        self._frame_seed += 1
+        reduce_push = struct.pack('2I', n_pixels, 0)
+
+        # ---- the actual command buffer ------------------------------
+        cb = self.ctx.allocate_command_buffers(1)[0]
+        vk.vkBeginCommandBuffer(cb, vk.VkCommandBufferBeginInfo(
+            sType=vk.VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+            flags=vk.VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+        ))
+
+        def _bind_and_dispatch(pipeline, push_bytes, gx, gy=1, gz=1):
+            vk.vkCmdBindPipeline(cb, vk.VK_PIPELINE_BIND_POINT_COMPUTE,
+                                   pipeline.pipeline)
+            vk.vkCmdBindDescriptorSets(
+                cb, vk.VK_PIPELINE_BIND_POINT_COMPUTE,
+                pipeline.layout, 0, 1, [pipeline.descriptor_set], 0, None)
+            pc = ffi.new('char[]', push_bytes)
+            vk.vkCmdPushConstants(
+                cb, pipeline.layout,
+                vk.VK_SHADER_STAGE_COMPUTE_BIT,
+                0, len(push_bytes), ffi.cast('void*', pc))
+            vk.vkCmdDispatch(cb, gx, gy, gz)
+
+        def _barrier():
+            # Global memory barrier between compute dispatches —
+            # makes prior shader writes visible before next reads.
+            mb = vk.VkMemoryBarrier(
+                sType=vk.VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                srcAccessMask=vk.VK_ACCESS_SHADER_WRITE_BIT,
+                dstAccessMask=(vk.VK_ACCESS_SHADER_READ_BIT
+                                | vk.VK_ACCESS_SHADER_WRITE_BIT),
+            )
+            vk.vkCmdPipelineBarrier(
+                cb,
+                vk.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                vk.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                0, 1, [mb], 0, None, 0, None)
+
+        # 1. clear / decay
+        _bind_and_dispatch(self._clear_pipe, clear_push,
+                            gx=(size + 63) // 64)
+        _barrier()
+
+        # 2. chaos game
+        _bind_and_dispatch(self._chaos_pipe, chaos_push,
+                            gx=self.n_walkers // WORKGROUP_WALKERS)
+        _barrier()
+
+        # 3. reduce max (also zeroes max_buf via the shader's atomicMax-
+        # against-uninitialized contract — caller is expected to zero
+        # max_buf before each render; we do it inline so the user of
+        # frame() doesn't have to remember). Note: zero_buffer is a
+        # host-side write, so it MUST happen before vkQueueSubmit —
+        # do it before recording closes.
+        self.ctx.zero_buffer(self.max_buf)
+        _bind_and_dispatch(self._reduce_pipe, reduce_push,
+                            gx=(n_pixels + 255) // 256)
+
+        vk.vkEndCommandBuffer(cb)
+
+        # ---- submit + wait -----------------------------------------
+        submit = vk.VkSubmitInfo(
+            sType=vk.VK_STRUCTURE_TYPE_SUBMIT_INFO,
+            commandBufferCount=1, pCommandBuffers=[cb],
+        )
+        fence = vk.vkCreateFence(
+            self.ctx.device, vk.VkFenceCreateInfo(
+                sType=vk.VK_STRUCTURE_TYPE_FENCE_CREATE_INFO), None)
+        vk.vkQueueSubmit(self.ctx.graphics_queue, 1, [submit], fence)
+        vk.vkWaitForFences(self.ctx.device, 1, [fence], vk.VK_TRUE,
+                            0xFFFFFFFFFFFFFFFF)
+        vk.vkDestroyFence(self.ctx.device, fence, None)
+        vk.vkFreeCommandBuffers(
+            self.ctx.device, self.ctx.command_pool, 1, [cb])
 
     # ----- readback -----------------------------------------------------
 
