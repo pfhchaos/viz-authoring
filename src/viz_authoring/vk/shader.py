@@ -15,11 +15,41 @@ Supports:
 """
 from __future__ import annotations
 
+import hashlib
+import os
 import re
 import subprocess
 import tempfile
 from pathlib import Path
 from typing import Callable
+
+# Default on-disk SPIR-V cache: avoids re-running glslc (~165 ms per
+# shader subprocess) when the source hasn't changed. Independent of
+# the Vulkan pipeline cache — that one caches driver-side pipeline
+# compilation; this one caches the GLSL→SPIR-V step. Both together
+# get FlameDemo's cold-start time from ~1.5s to << 0.5s on a warm
+# cache. Set FLAME_SHEEP_VK_SPIRV_CACHE='' to disable.
+_DEFAULT_SPIRV_CACHE = (
+    Path(os.environ.get('XDG_CACHE_HOME',
+                         Path.home() / '.cache'))
+    / 'flame-sheep' / 'vulkan' / 'spirv'
+)
+_SPIRV_CACHE_DIR = (
+    None if os.environ.get('FLAME_SHEEP_VK_SPIRV_CACHE') == ''
+    else Path(os.environ.get('FLAME_SHEEP_VK_SPIRV_CACHE',
+                              str(_DEFAULT_SPIRV_CACHE)))
+)
+
+
+def _cache_key(stage: str, source: str) -> str:
+    """Hash the post-include-resolution post-transform source + stage
+    label. Source equality → cache hit; any text change → miss.
+    SHA-1 (fast; collisions don't matter for a local cache)."""
+    h = hashlib.sha1()
+    h.update(stage.encode())
+    h.update(b'\0')
+    h.update(source.encode())
+    return h.hexdigest()
 
 
 # Mapping from filename suffix → glslc stage name. Lets callers pass a
@@ -72,12 +102,20 @@ def compile_shader(source_path: Path | str, stage: str | None = None,
                 f'Cannot infer shader stage from suffix {source_path.suffix!r}. '
                 f'Pass stage= explicitly or use one of {list(_SUFFIX_STAGE)}.')
 
-    # Read + inline includes + apply transform → write to a temp file
-    # in the original shader dir so glslc's error messages keep the
-    # familiar location context.
+    # Read + inline includes + apply transform → text we'd hand to glslc.
     src = resolve_includes(source_path.read_text(), source_path.parent)
     if source_transform is not None:
         src = source_transform(src)
+
+    # SPIR-V cache lookup. Key = sha1(stage + final source). Hit avoids
+    # the ~165 ms glslc subprocess; miss runs glslc + writes the cache.
+    if _SPIRV_CACHE_DIR is not None:
+        key = _cache_key(stage, src)
+        cached = _SPIRV_CACHE_DIR / f'{key}.spv'
+        if cached.exists():
+            return cached.read_bytes()
+    else:
+        cached = None
 
     # Use a tempfile co-located with the original so any residual
     # relative paths resolve sensibly.
@@ -94,7 +132,20 @@ def compile_shader(source_path: Path | str, stage: str | None = None,
         if result.returncode != 0:
             raise RuntimeError(
                 f'glslc failed for {source_path}:\n{result.stderr}')
-        return Path(spv_path).read_bytes()
+        spv = Path(spv_path).read_bytes()
     finally:
         Path(tmp_src_path).unlink(missing_ok=True)
         Path(spv_path).unlink(missing_ok=True)
+
+    if cached is not None:
+        try:
+            _SPIRV_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+            # Atomic-ish write: tmp file in same dir, rename. Multiple
+            # processes building the same shader will race but the last
+            # writer wins and both have identical bytes.
+            tmp_path = cached.with_suffix(cached.suffix + '.tmp')
+            tmp_path.write_bytes(spv)
+            tmp_path.replace(cached)
+        except OSError:
+            pass  # cache write best-effort; don't fail the compile
+    return spv
