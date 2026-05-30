@@ -386,7 +386,17 @@ class ComputePipeline:
                  shader_path: 'Path | str',
                  buffers: list,
                  push_constant_size: int = 0,
-                 source_transform=None):
+                 source_transform=None,
+                 specialization: dict[int, int | float] | None = None):
+        """specialization: optional {constant_id: value} dict for Vulkan
+        specialization constants. The driver constant-folds these at
+        pipeline-creation time. Each unique combination produces a
+        distinct compiled pipeline — caller is responsible for caching
+        pipelines per (shader + spec-values) tuple if recompile cost
+        matters.
+
+        Values are int or float; we pack each as 4 bytes (i32 / f32).
+        Larger or unsigned types would need a richer API."""
         from .shader import compile_shader
         self.ctx = ctx
 
@@ -472,11 +482,43 @@ class ComputePipeline:
         vk.vkUpdateDescriptorSets(ctx.device, len(writes), writes, 0, None)
 
         # Build the pipeline.
-        stage = vk.VkPipelineShaderStageCreateInfo(
+        # Specialization info — driver constant-folds these at compile
+        # time. Each unique value tuple → distinct compiled pipeline.
+        stage_kwargs = dict(
             sType=vk.VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
             stage=vk.VK_SHADER_STAGE_COMPUTE_BIT,
             module=module, pName='main',
         )
+        if specialization:
+            import cffi
+            import struct as _struct
+            _ffi = cffi.FFI()
+            entries = []
+            data_parts = []
+            offset = 0
+            for const_id, value in sorted(specialization.items()):
+                if isinstance(value, int):
+                    data_parts.append(_struct.pack('i', value))
+                elif isinstance(value, float):
+                    data_parts.append(_struct.pack('f', value))
+                else:
+                    raise TypeError(
+                        f'specialization values must be int or float; '
+                        f'got {type(value).__name__} for id={const_id}')
+                entries.append(vk.VkSpecializationMapEntry(
+                    constantID=const_id, offset=offset, size=4))
+                offset += 4
+            data = b''.join(data_parts)
+            # Hold the buffer reference alive on `self` so it doesn't
+            # get GC'd before vkCreateComputePipelines reads it.
+            self._spec_buf = _ffi.new('char[]', data)
+            spec_info = vk.VkSpecializationInfo(
+                mapEntryCount=len(entries), pMapEntries=entries,
+                dataSize=len(data),
+                pData=_ffi.cast('void*', self._spec_buf),
+            )
+            stage_kwargs['pSpecializationInfo'] = spec_info
+        stage = vk.VkPipelineShaderStageCreateInfo(**stage_kwargs)
         cp_create = vk.VkComputePipelineCreateInfo(
             sType=vk.VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
             stage=stage, layout=self.layout,
