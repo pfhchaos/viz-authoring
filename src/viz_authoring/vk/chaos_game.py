@@ -1,0 +1,273 @@
+"""ChaosGame — Vulkan port of flame_sheep/rendering/chaos.py.
+
+Owns all the buffers + pipelines needed to run the chaos game on Vulkan.
+Standalone (unlike the GL version which holds a back-reference to
+FlameRenderer's shared buffers) — the renderer port plugs this in
+directly. One ChaosGame instance per canvas/genome configuration;
+swap genomes via set_genome() without rebuilding pipelines.
+
+Buffer layout matches flame_chaos.comp's binding order:
+    0: histogram (uint, 2*n_pixels — [hits | colors])
+    1: walkers (float, n_walkers * 3 — [x,y,c per walker])
+    2: affines, 3: active_vars, 4: colors, 5: weights, 6: color_speeds
+    7: transform_hits (per-transform per-pixel counts; for cluster scoring)
+    8: post_affines, 9: pre_variations
+
+The pipeline holds 4 ComputePipelines: clear, chaos, density_estimation,
+reduce_max. downsample_hist isn't included here — it's part of the
+tonemap path (different bindings).
+"""
+from __future__ import annotations
+
+import struct
+from pathlib import Path
+
+import numpy as np
+
+from .pipeline import ComputePipeline
+
+SHADER_DIR = Path(__file__).parent / 'shaders'
+
+MAX_TRANSFORMS = 6      # matches flame_chaos.comp + flame_sheep/genome
+MAX_ACTIVE_VARS = 8
+SLOT_SIZE = 10          # bytes per variation slot (var_idx, weight, 8 params)
+WORKGROUP_WALKERS = 64  # flame_chaos.comp local_size_x
+
+
+def _symmetry_inject(src: str) -> str:
+    """flame.comp's variations.glsl has a {{SYMMETRY_GROUPS}} placeholder
+    that has to be expanded with the WALLPAPER_* / FRIEZE_* constant
+    tables before the shader will compile."""
+    from flame_sheep.variations._symmetry_groups import generate_glsl
+    return src.replace('// {{SYMMETRY_GROUPS}}', generate_glsl())
+
+
+class ChaosGame:
+    """Vulkan chaos-game runner. Allocate-once, reuse across frames /
+    genome swaps."""
+
+    def __init__(self, ctx, canvas_w: int, canvas_h: int,
+                 n_walkers: int = 65536):
+        if n_walkers % WORKGROUP_WALKERS != 0:
+            raise ValueError(
+                f'n_walkers ({n_walkers}) must be divisible by '
+                f'WORKGROUP_WALKERS ({WORKGROUP_WALKERS})')
+        self.ctx = ctx
+        self.canvas_w = canvas_w
+        self.canvas_h = canvas_h
+        self.n_walkers = n_walkers
+        n_pixels = canvas_w * canvas_h
+
+        # --- buffer allocation in flame_chaos.comp binding order ---
+        T = MAX_TRANSFORMS + 1  # +1 slot for final xform
+        SL = MAX_ACTIVE_VARS * SLOT_SIZE
+
+        self.histogram = ctx.create_buffer(n_pixels * 2 * 4, 'storage')   # 0
+        self.walkers = ctx.create_buffer(n_walkers * 3 * 4, 'storage')    # 1
+        self.affines = ctx.create_buffer(T * 6 * 4, 'storage')             # 2
+        self.active_vars = ctx.create_buffer(T * SL * 4, 'storage')       # 3
+        self.colors = ctx.create_buffer(T * 4, 'storage')                  # 4
+        self.weights = ctx.create_buffer(MAX_TRANSFORMS * 4, 'storage')   # 5
+        self.color_speeds = ctx.create_buffer(T * 4, 'storage')           # 6
+        self.transform_hits = ctx.create_buffer(
+            n_pixels * MAX_TRANSFORMS * 4, 'storage')                      # 7
+        self.post_affines = ctx.create_buffer(T * 6 * 4, 'storage')       # 8
+        self.pre_vars = ctx.create_buffer(T * SL * 4, 'storage')          # 9
+
+        # Initialize empty-genome state so a render without set_genome()
+        # doesn't crash (e.g. pre-set_genome smoke tests).
+        ctx.upload(self.weights, np.array([1.0] + [0.0]*(MAX_TRANSFORMS-1),
+                                           dtype=np.float32))
+        # Identity affines for all transforms
+        identity = np.tile(np.array([1, 0, 0, 0, 1, 0], dtype=np.float32),
+                            T).reshape(T, 6).flatten()
+        ctx.upload(self.affines, identity)
+        ctx.upload(self.post_affines, identity)
+        # Active vars: transform 0 = linear (idx 0), rest empty
+        av = np.full(T * SL, -1.0, dtype=np.float32)
+        av[0] = 0.0  # var_idx
+        av[1] = 1.0  # weight
+        ctx.upload(self.active_vars, av)
+        ctx.upload(self.pre_vars, np.full(T * SL, -1.0, dtype=np.float32))
+        ctx.upload(self.colors, np.full(T, 0.5, dtype=np.float32))
+        ctx.upload(self.color_speeds, np.full(T, 0.5, dtype=np.float32))
+        ctx.zero_buffer(self.histogram)
+        ctx.zero_buffer(self.transform_hits)
+        self.reset_walkers()
+
+        # --- pipelines ---
+        # clear: 1 buffer (histogram), 12 bytes push (size, decay, offset)
+        self._clear_pipe = ComputePipeline(
+            ctx, SHADER_DIR / 'clear_histogram.comp',
+            buffers=[self.histogram], push_constant_size=12)
+
+        # chaos: 10 buffers, 60 bytes push
+        self._chaos_pipe = ComputePipeline(
+            ctx, SHADER_DIR / 'flame_chaos.comp',
+            buffers=[self.histogram, self.walkers, self.affines,
+                     self.active_vars, self.colors, self.weights,
+                     self.color_speeds, self.transform_hits,
+                     self.post_affines, self.pre_vars],
+            push_constant_size=64,  # 60 bytes; round to 64 for alignment
+            source_transform=_symmetry_inject)
+
+        # density_estimation: separate input/output histograms — we use
+        # a scratch buffer the same size as histogram and ping-pong.
+        self.histogram_scratch = ctx.create_buffer(
+            n_pixels * 2 * 4, 'storage')
+        self._de_pipe = ComputePipeline(
+            ctx, SHADER_DIR / 'density_estimation.comp',
+            buffers=[self.histogram, self.histogram_scratch],
+            push_constant_size=16)
+
+        # reduce_max: histogram + max_buf
+        self.max_buf = ctx.create_buffer(4, 'storage')
+        self._reduce_pipe = ComputePipeline(
+            ctx, SHADER_DIR / 'reduce_max.comp',
+            buffers=[self.histogram, self.max_buf],
+            push_constant_size=8)
+
+        self._frame_seed = 0
+
+    # ----- genome wiring ------------------------------------------------
+
+    def set_genome(self, *,
+                   affines: np.ndarray, post_affines: np.ndarray,
+                   active_vars: np.ndarray, pre_vars: np.ndarray,
+                   colors: np.ndarray, weights: np.ndarray,
+                   color_speeds: np.ndarray,
+                   n_transforms: int, has_final_xform: bool):
+        """Upload a genome's buffer contents.
+
+        Each array must have the shape the shader expects (e.g. affines
+        = (MAX_TRANSFORMS+1, 6) float32). n_transforms and
+        has_final_xform are remembered for later render_frame() calls.
+        """
+        T = MAX_TRANSFORMS + 1
+        SL = MAX_ACTIVE_VARS * SLOT_SIZE
+
+        def _check(name, arr, expected_shape):
+            if arr.shape != expected_shape:
+                raise ValueError(
+                    f'{name}: expected shape {expected_shape}, got {arr.shape}')
+
+        _check('affines', affines, (T, 6))
+        _check('post_affines', post_affines, (T, 6))
+        _check('active_vars', active_vars, (T, MAX_ACTIVE_VARS, SLOT_SIZE))
+        _check('pre_vars', pre_vars, (T, MAX_ACTIVE_VARS, SLOT_SIZE))
+        _check('colors', colors, (T,))
+        _check('color_speeds', color_speeds, (T,))
+        _check('weights', weights, (MAX_TRANSFORMS,))
+
+        self.ctx.upload(self.affines, affines.astype(np.float32).ravel())
+        self.ctx.upload(self.post_affines,
+                         post_affines.astype(np.float32).ravel())
+        self.ctx.upload(self.active_vars,
+                         active_vars.astype(np.float32).ravel())
+        self.ctx.upload(self.pre_vars, pre_vars.astype(np.float32).ravel())
+        self.ctx.upload(self.colors, colors.astype(np.float32))
+        self.ctx.upload(self.color_speeds, color_speeds.astype(np.float32))
+        self.ctx.upload(self.weights, weights.astype(np.float32))
+        self._n_transforms = int(n_transforms)
+        self._has_final_xform = 1 if has_final_xform else 0
+
+    def reset_walkers(self, seed: int | None = None):
+        """Random walker positions in [-1, 1]. Call after a genome swap
+        so walkers from the prior genome's attractor don't pollute the
+        new one."""
+        rng = np.random.default_rng(seed)
+        data = rng.uniform(-1, 1, (self.n_walkers, 3)).astype(np.float32)
+        self.ctx.upload(self.walkers, data)
+
+    # ----- per-frame ops ------------------------------------------------
+
+    def clear_histogram(self, decay: float = 0.0):
+        """Zero (decay=0) or decay (multiply by decay/256) the histogram.
+        Always clears the whole buffer from offset 0 — compare-mode
+        handling will come later."""
+        n_pixels = self.canvas_w * self.canvas_h
+        size = n_pixels * 2  # hits + colors regions
+        push = struct.pack('3I', size, int(decay * 256), 0)
+        groups = (size + 63) // 64
+        self.ctx.dispatch_compute(self._clear_pipe, groups_x=groups,
+                                    push_constants=push)
+
+    def render_frame(self, iterations: int = 30,
+                     zoom: tuple[float, float] = (1.0, 1.0),
+                     rotation: float = 0.0,
+                     center: tuple[float, float] = (0.0, 0.0)):
+        """One chaos-game pass: n_walkers walkers, each running
+        `iterations` steps. Histogram is mutated in place (caller
+        should clear_histogram() first if they want a fresh frame)."""
+        import math
+        cos_r = math.cos(rotation)
+        sin_r = math.sin(rotation)
+        n_pixels = self.canvas_w * self.canvas_h
+        # Push layout matches flame_chaos.comp's PushConstants:
+        #   int n_transforms; pad; vec2 zoom; float cos, sin; vec2 center;
+        #   int w, h, iters, has_final; uint seed, offset, stride
+        push = struct.pack(
+            'i 4x 2f 2f 2f 4i I 2I',
+            self._n_transforms,
+            zoom[0], zoom[1],
+            cos_r, sin_r,
+            center[0], center[1],
+            self.canvas_w, self.canvas_h, iterations, self._has_final_xform,
+            self._frame_seed, 0, n_pixels,
+        )
+        self._frame_seed += 1
+        groups = self.n_walkers // WORKGROUP_WALKERS
+        self.ctx.dispatch_compute(self._chaos_pipe, groups_x=groups,
+                                    push_constants=push)
+
+    def density_estimate(self, max_radius: int = 5, curve: float = 0.5):
+        """Adaptive density-estimation post-process. Writes scattered
+        result to histogram_scratch, then swaps buffers so subsequent
+        ops see the smoothed histogram.
+
+        Note: ping-pong via swap means histogram_scratch holds the OLD
+        unfiltered histogram after this call. clear_histogram() targets
+        the live histogram, so it'll clear the smoothed-result side —
+        callers running DE every frame want to clear scratch instead
+        (TODO when needed)."""
+        self.ctx.zero_buffer(self.histogram_scratch)
+        push = struct.pack('3if', self.canvas_w, self.canvas_h,
+                            int(max_radius), float(curve))
+        gx = (self.canvas_w + 15) // 16
+        gy = (self.canvas_h + 15) // 16
+        self.ctx.dispatch_compute(self._de_pipe, groups_x=gx, groups_y=gy,
+                                    push_constants=push)
+        # Swap so the live histogram is the smoothed one.
+        self.histogram, self.histogram_scratch = (
+            self.histogram_scratch, self.histogram)
+
+    def reduce_max_hits(self) -> int:
+        """Compute the max value across the hit-count region (first
+        n_pixels of the histogram). Returns the value. Used by tonemap
+        for brightness normalization."""
+        self.ctx.zero_buffer(self.max_buf)
+        n_pixels = self.canvas_w * self.canvas_h
+        push = struct.pack('2I', n_pixels, 0)
+        groups = (n_pixels + 255) // 256
+        self.ctx.dispatch_compute(self._reduce_pipe, groups_x=groups,
+                                    push_constants=push)
+        return int(self.ctx.download(self.max_buf, np.uint32, 1)[0])
+
+    # ----- readback -----------------------------------------------------
+
+    def download_histogram(self) -> tuple[np.ndarray, np.ndarray]:
+        """Returns (hits, color_acc) — each (H, W) uint32. Both arrays
+        share the same indexing: hits[y, x] = histogram[y*W + x],
+        color_acc[y, x] = histogram[n_pixels + y*W + x].
+        Color_idx for a pixel = color_acc / (hits * COLOR_SCALE)."""
+        n_pixels = self.canvas_w * self.canvas_h
+        flat = self.ctx.download(self.histogram, np.uint32, n_pixels * 2)
+        hits = flat[:n_pixels].reshape(self.canvas_h, self.canvas_w)
+        color_acc = flat[n_pixels:].reshape(self.canvas_h, self.canvas_w)
+        return hits, color_acc
+
+    def cleanup(self):
+        for p in (self._clear_pipe, self._chaos_pipe, self._de_pipe,
+                  self._reduce_pipe):
+            p.cleanup()
+        # buffers get auto-cleaned by ctx.cleanup()
