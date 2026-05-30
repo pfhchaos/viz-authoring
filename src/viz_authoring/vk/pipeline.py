@@ -192,11 +192,12 @@ class ComputePipeline:
     def __init__(self, ctx,
                  shader_path: 'Path | str',
                  buffers: list,
-                 push_constant_size: int = 0):
+                 push_constant_size: int = 0,
+                 source_transform=None):
         from .shader import compile_shader
         self.ctx = ctx
 
-        spv = compile_shader(shader_path)
+        spv = compile_shader(shader_path, source_transform=source_transform)
         module = vk.vkCreateShaderModule(
             ctx.device,
             vk.VkShaderModuleCreateInfo(
