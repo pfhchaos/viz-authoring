@@ -36,6 +36,39 @@ from .flame_demo import _fire_palette, _sierpinski_genome
 SHADER_DIR = Path(__file__).parent / 'shaders'
 
 
+def _genome_from_catalog(genome_id: int):
+    """Load a real genome from flame_sheep's catalog and shape it into
+    ChaosGame.set_genome() kwargs + a palette as (1, 256, 4) uint8.
+
+    Returns (set_genome_kwargs, palette_rgba8, zoom_tuple, rotation, center).
+    Caller uses zoom/rotation/center on each render_frame() call —
+    they're per-frame uniforms, not part of set_genome state."""
+    from flame_sheep.storage.library import Library
+    lib = Library()
+    g = lib.load_genome(genome_id)
+    arrays = g.to_gpu_arrays()
+    # ChaosGame.set_genome expects 3D shape; catalog returns flattened (T, 80).
+    av = arrays['active_vars'].reshape(7, 8, 10)
+    pv = arrays['pre_active_vars'].reshape(7, 8, 10)
+    kwargs = dict(
+        affines=arrays['affines'],
+        post_affines=arrays['post_affines'],
+        active_vars=av, pre_vars=pv,
+        colors=arrays['colors'],
+        color_speeds=arrays['color_speeds'],
+        weights=arrays['weights'],
+        n_transforms=len(g.transforms),
+        has_final_xform=arrays['has_final_xform'],
+    )
+    # Palette: catalog gives (256, 3) float32 in [0,1]; image uploader
+    # wants (1, 256, 4) uint8 with alpha=255.
+    pal_rgb = (np.clip(g.palette, 0.0, 1.0) * 255.0).astype(np.uint8)
+    pal_rgba = np.zeros((1, 256, 4), dtype=np.uint8)
+    pal_rgba[0, :, :3] = pal_rgb
+    pal_rgba[0, :, 3] = 255
+    return kwargs, pal_rgba, (g.zoom, g.zoom), g.rotation, tuple(g.center)
+
+
 class WallpaperDemo:
     CANVAS_W = 512
     CANVAS_H = 512
@@ -43,7 +76,15 @@ class WallpaperDemo:
     GAMMA = 2.0
 
     def __init__(self, output_name: str | None = None,
-                 genome: dict | None = None):
+                 genome: dict | None = None,
+                 palette: np.ndarray | None = None,
+                 zoom: tuple[float, float] = (1.0, 1.0),
+                 rotation: float = 0.0,
+                 center: tuple[float, float] = (0.0, 0.0)):
+        # Per-frame chaos game uniforms stashed for the render loop.
+        self._zoom = zoom
+        self._rotation = rotation
+        self._center = center
         # Layer-shell surface first — it talks to the compositor and
         # negotiates a size, which we need before building the swapchain.
         self.window = LayerShellSurface(output_name=output_name)
@@ -69,7 +110,9 @@ class WallpaperDemo:
         self.chaos.reset_walkers(seed=0)
 
         self.palette_image = create_image_rgba8(self.ctx, 256, 1)
-        upload_image_rgba8(self.ctx, self.palette_image, _fire_palette())
+        upload_image_rgba8(
+            self.ctx, self.palette_image,
+            palette if palette is not None else _fire_palette())
         self.palette_sampler = create_linear_sampler(self.ctx)
 
         self.tonemap = GraphicsPipeline(
@@ -133,7 +176,9 @@ class WallpaperDemo:
 
     def _draw_frame(self):
         self.chaos.clear_histogram(decay=0.0)
-        self.chaos.render_frame(iterations=80)
+        self.chaos.render_frame(iterations=80, zoom=self._zoom,
+                                  rotation=self._rotation,
+                                  center=self._center)
         self.chaos.reduce_max_hits()
 
         vk.vkWaitForFences(self.ctx.device, 1, [self.in_flight],
@@ -206,6 +251,9 @@ def main():
                         help='List available wl_output names + exit')
     parser.add_argument('--max-frames', type=int, default=None,
                         help='Render N frames + exit (for headless smoke)')
+    parser.add_argument('--genome-id', type=int, default=None,
+                        help='Load a genome from the flame_sheep catalog '
+                             '(default: hardcoded Sierpinski + fire palette)')
     args = parser.parse_args()
 
     if args.list_outputs:
@@ -213,7 +261,15 @@ def main():
             print(name)
         return
 
-    demo = WallpaperDemo(output_name=args.output)
+    extra = {}
+    if args.genome_id is not None:
+        kwargs, palette, zoom, rotation, center = _genome_from_catalog(
+            args.genome_id)
+        extra = dict(genome=kwargs, palette=palette, zoom=zoom,
+                      rotation=rotation, center=center)
+        print(f'loaded genome {args.genome_id} '
+              f'(zoom={zoom[0]:.3f}, rotation={rotation:.3f})')
+    demo = WallpaperDemo(output_name=args.output, **extra)
     print(f'device: {demo.ctx.device_name}')
     print(f'output {demo.window._output_name}: '
           f'{demo.swapchain.extent.width}x{demo.swapchain.extent.height}, '
