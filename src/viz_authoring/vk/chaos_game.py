@@ -102,15 +102,22 @@ class ChaosGame:
             ctx, SHADER_DIR / 'clear_histogram.comp',
             buffers=[self.histogram], push_constant_size=12)
 
-        # chaos: 10 buffers, 60 bytes push
-        self._chaos_pipe = ComputePipeline(
-            ctx, SHADER_DIR / 'flame_chaos.comp',
-            buffers=[self.histogram, self.walkers, self.affines,
-                     self.active_vars, self.colors, self.weights,
-                     self.color_speeds, self.transform_hits,
-                     self.post_affines, self.pre_vars],
-            push_constant_size=64,  # 60 bytes; round to 64 for alignment
-            source_transform=_symmetry_inject)
+        # chaos: spec-const variant — n_transforms, has_final_xform,
+        # width, height are bound at pipeline-creation time so the driver
+        # can constant-fold pick_transform's loop bound, dead-strip the
+        # final-xform block when unused, and fold width/height literals
+        # into world_to_pixel. Measured 2.3× cycle reduction vs the
+        # unspec-const'd flame_chaos.comp on production genomes; see
+        # tools/vk_perf_diag/measure_spec_const_threshold.py.
+        #
+        # width / height are fixed for this ChaosGame's lifetime;
+        # n_transforms / has_final_xform vary per genome — so we cache
+        # one pipeline per (n_transforms, has_final_xform) tuple and
+        # swap on set_genome(). At most 6×2 = 12 distinct pipelines.
+        self._chaos_pipes: dict = {}
+        # Pre-build the default (1, 0) entry so callers can render
+        # before calling set_genome() (smoke tests do this).
+        self._chaos_pipe = self._get_chaos_pipe(1, 0)
 
         # density_estimation: separate input/output histograms — we use
         # a scratch buffer the same size as histogram and ping-pong.
@@ -129,6 +136,31 @@ class ChaosGame:
             push_constant_size=8)
 
         self._frame_seed = 0
+
+    def _get_chaos_pipe(self, n_transforms: int, has_final_xform: int):
+        """Look up or build the chaos pipeline specialized for this
+        genome's (n_transforms, has_final_xform). Pipelines are cached
+        per-tuple — first-call cost is a shader compile + driver-side
+        SPIR-V→ISA, subsequent calls are dict-lookup-cheap."""
+        key = (int(n_transforms), int(has_final_xform))
+        pipe = self._chaos_pipes.get(key)
+        if pipe is None:
+            pipe = ComputePipeline(
+                self.ctx, SHADER_DIR / 'flame_chaos_specconst.comp',
+                buffers=[self.histogram, self.walkers, self.affines,
+                         self.active_vars, self.colors, self.weights,
+                         self.color_speeds, self.transform_hits,
+                         self.post_affines, self.pre_vars],
+                push_constant_size=40,  # see frame() for layout
+                source_transform=_symmetry_inject,
+                specialization={
+                    0: key[0],          # SC_n_transforms
+                    1: key[1],          # SC_has_final_xform
+                    2: self.canvas_w,   # SC_width
+                    3: self.canvas_h,   # SC_height
+                })
+            self._chaos_pipes[key] = pipe
+        return pipe
 
     # ----- genome wiring ------------------------------------------------
 
@@ -171,6 +203,12 @@ class ChaosGame:
         self.ctx.upload(self.weights, weights.astype(np.float32))
         self._n_transforms = int(n_transforms)
         self._has_final_xform = 1 if has_final_xform else 0
+        # Swap in the chaos pipeline specialized for this genome's
+        # shape. First-time use of a tuple builds it (driver compile);
+        # subsequent set_genome() calls with the same shape just look
+        # up the cached pipeline.
+        self._chaos_pipe = self._get_chaos_pipe(
+            self._n_transforms, self._has_final_xform)
 
     def reset_walkers(self, seed: int | None = None):
         """Random walker positions in [-1, 1]. Call after a genome swap
@@ -204,16 +242,17 @@ class ChaosGame:
         cos_r = math.cos(rotation)
         sin_r = math.sin(rotation)
         n_pixels = self.canvas_w * self.canvas_h
-        # Push layout matches flame_chaos.comp's PushConstants:
-        #   int n_transforms; pad; vec2 zoom; float cos, sin; vec2 center;
-        #   int w, h, iters, has_final; uint seed, offset, stride
+        # Push layout matches flame_chaos_specconst.comp's PushConstants:
+        #   vec2 zoom; float cos, sin; vec2 center;
+        #   int iters; uint seed, offset, stride
+        # n_transforms / has_final_xform / w / h moved to specialization
+        # constants (driver constant-folds at pipeline-creation time).
         push = struct.pack(
-            'i 4x 2f 2f 2f 4i I 2I',
-            self._n_transforms,
+            '2f 2f 2f i I 2I',
             zoom[0], zoom[1],
             cos_r, sin_r,
             center[0], center[1],
-            self.canvas_w, self.canvas_h, iterations, self._has_final_xform,
+            iterations,
             self._frame_seed, 0, n_pixels,
         )
         self._frame_seed += 1
@@ -293,14 +332,14 @@ class ChaosGame:
         # ---- precompute per-dispatch push constants -----------------
         clear_push = struct.pack('3I', size, int(decay * 256), 0)
         cos_r = math.cos(rotation); sin_r = math.sin(rotation)
+        # See render_frame() for layout; n_transforms / has_final_xform
+        # / w / h are spec consts on the current pipeline.
         chaos_push = struct.pack(
-            'i 4x 2f 2f 2f 4i I 2I',
-            self._n_transforms,
+            '2f 2f 2f i I 2I',
             zoom[0], zoom[1],
             cos_r, sin_r,
             center[0], center[1],
-            self.canvas_w, self.canvas_h, iterations,
-            self._has_final_xform,
+            iterations,
             self._frame_seed, 0, n_pixels,
         )
         self._frame_seed += 1
@@ -392,7 +431,9 @@ class ChaosGame:
         return hits, color_acc
 
     def cleanup(self):
-        for p in (self._clear_pipe, self._chaos_pipe, self._de_pipe,
-                  self._reduce_pipe):
+        for p in (self._clear_pipe, self._de_pipe, self._reduce_pipe):
             p.cleanup()
+        for p in self._chaos_pipes.values():
+            p.cleanup()
+        self._chaos_pipes.clear()
         # buffers get auto-cleaned by ctx.cleanup()
