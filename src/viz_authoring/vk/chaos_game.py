@@ -19,6 +19,7 @@ tonemap path (different bindings).
 """
 from __future__ import annotations
 
+import re
 import struct
 from pathlib import Path
 
@@ -41,6 +42,41 @@ def _symmetry_inject(src: str) -> str:
     tables before the shader will compile."""
     from flame_sheep.variations._symmetry_groups import generate_glsl
     return src.replace('// {{SYMMETRY_GROUPS}}', generate_glsl())
+
+
+_VAR_CASE_RE = re.compile(
+    r'^[ \t]+case\s+(\d+):\s*return var_\w+\([^)]*\);\s*\n',
+    re.MULTILINE,
+)
+
+
+def _trim_variations_switch(src: str, keep_vars: frozenset) -> str:
+    """Strip `case N:` lines from apply_single_variation's switch for
+    variations not in keep_vars. The `default: return p;` branch stays
+    as a safety fallback. With the active-vars buffer's invariant that
+    var_idx is always one of the genome's used variations when the
+    switch is reached, trimming is safe — every reachable case is kept.
+
+    Cuts the universal 127-case dispatcher down to typically 5-15 cases
+    per genome. That's the lever Mesa's register allocator needed:
+    pre-trim, the spill count on the full shader was 1929/3326; post-
+    trim it should drop dramatically (most genomes have ≤15 unique vars
+    which the spill-threshold table puts comfortably in SIMD8 no-spill
+    territory)."""
+    def maybe_drop(m):
+        idx = int(m.group(1))
+        return m.group(0) if idx in keep_vars else ''
+    return _VAR_CASE_RE.sub(maybe_drop, src)
+
+
+def _make_chaos_source_transform(keep_vars: frozenset):
+    """Compose the symmetry-group expansion with the genome-specific
+    variation-switch trim. Returned as a single source-transform
+    function (the shape ComputePipeline expects)."""
+    def _xform(src: str) -> str:
+        src = _symmetry_inject(src)
+        return _trim_variations_switch(src, keep_vars)
+    return _xform
 
 
 class ChaosGame:
@@ -115,9 +151,10 @@ class ChaosGame:
         # one pipeline per (n_transforms, has_final_xform) tuple and
         # swap on set_genome(). At most 6×2 = 12 distinct pipelines.
         self._chaos_pipes: dict = {}
-        # Pre-build the default (1, 0) entry so callers can render
-        # before calling set_genome() (smoke tests do this).
-        self._chaos_pipe = self._get_chaos_pipe(1, 0)
+        # Pre-build the default (1, 0, {0}) entry so callers can render
+        # before calling set_genome() (smoke tests do this). var_idx=0
+        # (linear) matches the empty-genome state set up above.
+        self._chaos_pipe = self._get_chaos_pipe(1, 0, frozenset({0}))
 
         # density_estimation: separate input/output histograms — we use
         # a scratch buffer the same size as histogram and ping-pong.
@@ -137,12 +174,22 @@ class ChaosGame:
 
         self._frame_seed = 0
 
-    def _get_chaos_pipe(self, n_transforms: int, has_final_xform: int):
+    def _get_chaos_pipe(self, n_transforms: int, has_final_xform: int,
+                          keep_vars: frozenset):
         """Look up or build the chaos pipeline specialized for this
-        genome's (n_transforms, has_final_xform). Pipelines are cached
-        per-tuple — first-call cost is a shader compile + driver-side
-        SPIR-V→ISA, subsequent calls are dict-lookup-cheap."""
-        key = (int(n_transforms), int(has_final_xform))
+        genome's (n_transforms, has_final_xform, variation set).
+        Pipelines are cached per-tuple — first-call cost is a shader
+        compile + driver-side SPIR-V→ISA, subsequent calls are
+        dict-lookup-cheap.
+
+        keep_vars is the set of variation indices used anywhere in the
+        genome (across all transforms' active_vars + pre_vars). The
+        source transform strips the 127-case switch in variations.glsl
+        down to only these cases. Universal shader has 1929:3326
+        spill/fill ops; trimmed-to-~15-cases should land in the
+        SIMD8 no-spill regime per measure_spill_threshold.py."""
+        key = (int(n_transforms), int(has_final_xform),
+               keep_vars)
         pipe = self._chaos_pipes.get(key)
         if pipe is None:
             pipe = ComputePipeline(
@@ -152,7 +199,7 @@ class ChaosGame:
                          self.color_speeds, self.transform_hits,
                          self.post_affines, self.pre_vars],
                 push_constant_size=40,  # see frame() for layout
-                source_transform=_symmetry_inject,
+                source_transform=_make_chaos_source_transform(keep_vars),
                 specialization={
                     0: key[0],          # SC_n_transforms
                     1: key[1],          # SC_has_final_xform
@@ -203,12 +250,21 @@ class ChaosGame:
         self.ctx.upload(self.weights, weights.astype(np.float32))
         self._n_transforms = int(n_transforms)
         self._has_final_xform = 1 if has_final_xform else 0
+        # Variation set = union of var_idx across active_vars + pre_vars,
+        # all transforms. The buffers' first element of each slot is
+        # var_idx (-1 = unused). We collect only var_idx >= 0; that's
+        # exactly the set of cases the trimmed switch needs to keep.
+        var_ids = np.concatenate([
+            active_vars[..., 0].ravel(),
+            pre_vars[..., 0].ravel(),
+        ])
+        keep_vars = frozenset(int(v) for v in var_ids if v >= 0)
         # Swap in the chaos pipeline specialized for this genome's
-        # shape. First-time use of a tuple builds it (driver compile);
-        # subsequent set_genome() calls with the same shape just look
-        # up the cached pipeline.
+        # shape + variation set. First-time use builds it (driver
+        # compile + driver-side SPIR-V→ISA); subsequent set_genome()
+        # calls with the same key just look up the cached pipeline.
         self._chaos_pipe = self._get_chaos_pipe(
-            self._n_transforms, self._has_final_xform)
+            self._n_transforms, self._has_final_xform, keep_vars)
 
     def reset_walkers(self, seed: int | None = None):
         """Random walker positions in [-1, 1]. Call after a genome swap
