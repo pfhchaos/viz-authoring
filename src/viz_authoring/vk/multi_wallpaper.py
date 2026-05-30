@@ -59,6 +59,13 @@ class MultiMonitorWallpaper:
     N_WALKERS = 65536
     GAMMA = 2.0
 
+    # Canvas density: render at half the densest monitor's PPI. Compute
+    # cost grows ~ppmm², so 0.5× is a meaningful saver vs full density,
+    # and the chaos-game's stochastic sampling means full density mostly
+    # just buys extra noise per pixel anyway. Match the GL renderer's
+    # choice for consistency.
+    RENDER_SCALE = 0.5
+
     def __init__(self, output_names: list[str],
                  genome: dict | None = None,
                  palette: np.ndarray | None = None,
@@ -72,14 +79,27 @@ class MultiMonitorWallpaper:
         self._center = center
         self._closed = False
 
-        # Single SIGINT handler at the session level — flips our flag,
-        # the run loop checks it. Per-surface handlers would race.
         signal.signal(signal.SIGINT, lambda *_: setattr(self, '_closed', True))
 
+        # 0. Discover physical layout (mm) — reuse the GL renderer's
+        # output-layout helper (xdg-output + swaymsg fallback, rotation-
+        # aware). Gives us {name: {x, y, w, h, ppi, phys_w_mm, phys_h_mm}}.
+        # Without this, viewports are pixel-based and a flame feature
+        # is a different physical size on each monitor (= lines don't
+        # match across boundaries on screens with different DPIs).
+        from flame_sheep.rendering.surface import _get_output_layout
+        layout = _get_output_layout()
+        missing = [n for n in output_names if n not in layout]
+        if missing:
+            raise RuntimeError(
+                f'outputs not in layout: {missing} '
+                f'(have {list(layout)})')
+        self._layout = {n: layout[n] for n in output_names}
+        max_ppi = max(g['ppi'] for g in self._layout.values())
+        self.canvas_ppmm = max_ppi / 25.4 * self.RENDER_SCALE
+
         # 1. Create all LayerShellSurfaces. Each opens its own Wayland
-        # Display — wasteful but simpler than sharing one. If this turns
-        # out to be a problem (compositor doesn't like repeated bindings
-        # of the same wl_output) we'll add a WaylandSession owner.
+        # Display — wasteful but simpler than sharing one.
         self.outputs: list[_OutputBundle] = []
         for name in output_names:
             ob = _OutputBundle()
@@ -123,20 +143,39 @@ class MultiMonitorWallpaper:
             sc.build_framebuffers(self.render_pass)
             ob.swapchain = sc
 
-        # 4. Compute viewport rectangles. Simple horizontal stacking in
-        # the supplied order; total canvas width = sum of output widths,
-        # height = max. Each output's viewport is its slice.
-        total_w = sum(ob.surface.width for ob in self.outputs)
-        total_h = max(ob.surface.height for ob in self.outputs)
-        self.virtual_w = total_w
-        self.virtual_h = total_h
-        cursor = 0
+        # 4. Compute viewport rectangles in PHYSICAL UNITS (mm), then
+        # project into canvas pixels at canvas_ppmm. This is what makes
+        # lines align across monitors with different pixel densities:
+        # a feature that's 10mm wide on DP-3's panel occupies the same
+        # number of canvas pixels as 10mm on DP-2, regardless of the
+        # monitors' pixel counts. Horizontal layout: stack in supplied
+        # order. Vertical: center each output on the tallest's center.
+        #
+        # The compositor-reported pixel position (layout[n]['x']) is
+        # NOT used directly — we accumulate physical widths in supplied
+        # order. Caller is expected to pass outputs in physical L→R
+        # order (or query via swaymsg / xdg-output and sort by x).
+        cursor_mm = 0.0
+        phys_x_mm: dict[str, float] = {}
         for ob in self.outputs:
-            ob.viewport_x = cursor
-            ob.viewport_y = 0
-            ob.viewport_w = ob.surface.width
-            ob.viewport_h = ob.surface.height
-            cursor += ob.surface.width
+            phys_x_mm[ob.name] = cursor_mm
+            cursor_mm += self._layout[ob.name]['phys_w_mm']
+        total_w_mm = cursor_mm
+        max_h_mm = max(g['phys_h_mm'] for g in self._layout.values())
+
+        for ob in self.outputs:
+            g = self._layout[ob.name]
+            # Center each output vertically on the tallest's center
+            y_offset_mm = (max_h_mm - g['phys_h_mm']) / 2.0
+            ob.viewport_x = int(phys_x_mm[ob.name] * self.canvas_ppmm)
+            ob.viewport_y = int(y_offset_mm * self.canvas_ppmm)
+            ob.viewport_w = int(g['phys_w_mm'] * self.canvas_ppmm)
+            ob.viewport_h = int(g['phys_h_mm'] * self.canvas_ppmm)
+
+        self.virtual_w = int(total_w_mm * self.canvas_ppmm)
+        self.virtual_h = int(max_h_mm * self.canvas_ppmm)
+        total_w = self.virtual_w  # alias for the existing references below
+        total_h = self.virtual_h
 
         # 5. Shared chaos game + palette + tonemap pipeline.
         # Canvas size matches the virtual desktop so each viewport pixel
@@ -334,9 +373,13 @@ def main():
                       rotation=rotation, center=center)
 
     demo = MultiMonitorWallpaper(outputs, **extra)
-    print(f'virtual canvas: {demo.virtual_w}x{demo.virtual_h}')
+    print(f'virtual canvas: {demo.virtual_w}x{demo.virtual_h} '
+          f'(@ {demo.canvas_ppmm:.2f} px/mm)')
     for ob in demo.outputs:
-        print(f'  {ob.name}: viewport ({ob.viewport_x},{ob.viewport_y}) '
+        g = demo._layout[ob.name]
+        print(f'  {ob.name}: panel {g["phys_w_mm"]:.0f}x{g["phys_h_mm"]:.0f}mm '
+              f'({g["ppi"]:.0f} PPI), surface {ob.surface.width}x{ob.surface.height}, '
+              f'viewport ({ob.viewport_x},{ob.viewport_y}) '
               f'{ob.viewport_w}x{ob.viewport_h}')
     print('Ctrl+C to exit')
     try:
