@@ -55,7 +55,15 @@ class VkContext:
     def __init__(self, instance_extensions: list[str],
                  app_name: str = 'viz_authoring',
                  picker=None,
-                 pipeline_cache_path: Path | None | str = 'default'):
+                 pipeline_cache_path: Path | None | str = 'default',
+                 queue_priority: int | None = None):
+        """queue_priority: optional VK_QUEUE_GLOBAL_PRIORITY_* value
+        (LOW/MEDIUM/HIGH/REALTIME). When set, requires
+        VK_KHR_global_priority on the device; the queue is created with
+        that priority for cross-process arbitration via the DRM scheduler.
+        Default None = use the driver's default priority (typically
+        MEDIUM-ish).
+        """
         """instance_extensions: list of instance extensions to enable.
         Typically includes VK_KHR_surface + a platform surface extension
         (VK_KHR_wayland_surface / VK_KHR_xlib_surface / ...).
@@ -78,6 +86,7 @@ class VkContext:
         self.graphics_queue = None
         self.graphics_queue_family = None
         self.pipeline_cache = None
+        self.queue_priority = queue_priority
         if pipeline_cache_path == 'default':
             self._cache_path: Path | None = self.DEFAULT_PIPELINE_CACHE_PATH
         elif pipeline_cache_path is None:
@@ -183,21 +192,39 @@ class VkContext:
         families = {self.graphics_queue_family}
         if self.present_queue_family is not None:
             families.add(self.present_queue_family)
+
+        # Optional pNext: global priority for cross-process DRM
+        # scheduler arbitration. Only attached when caller opted in
+        # via queue_priority — otherwise driver picks the default.
+        gp_pnext = None
+        if self.queue_priority is not None:
+            gp_pnext = vk.VkDeviceQueueGlobalPriorityCreateInfoKHR(
+                sType=vk.VK_STRUCTURE_TYPE_DEVICE_QUEUE_GLOBAL_PRIORITY_CREATE_INFO_KHR,
+                globalPriority=self.queue_priority,
+            )
+
         queue_create_infos = [
             vk.VkDeviceQueueCreateInfo(
                 sType=vk.VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+                pNext=gp_pnext,
                 queueFamilyIndex=fam,
                 queueCount=1,
                 pQueuePriorities=[1.0],
             )
             for fam in sorted(families)
         ]
+
+        device_extensions = list(REQUIRED_DEVICE_EXTENSIONS)
+        if self.queue_priority is not None:
+            device_extensions.append(
+                vk.VK_KHR_GLOBAL_PRIORITY_EXTENSION_NAME)
+
         device_create = vk.VkDeviceCreateInfo(
             sType=vk.VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
             queueCreateInfoCount=len(queue_create_infos),
             pQueueCreateInfos=queue_create_infos,
-            enabledExtensionCount=len(REQUIRED_DEVICE_EXTENSIONS),
-            ppEnabledExtensionNames=REQUIRED_DEVICE_EXTENSIONS,
+            enabledExtensionCount=len(device_extensions),
+            ppEnabledExtensionNames=device_extensions,
             enabledLayerCount=0,
         )
         self.device = vk.vkCreateDevice(
