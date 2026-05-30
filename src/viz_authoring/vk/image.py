@@ -58,6 +58,68 @@ class VkImage:
         self.view = None
 
 
+def create_color_attachment_image(ctx, width: int, height: int) -> VkImage:
+    """DEVICE_LOCAL RGBA8 image suitable for being a render target AND
+    being sampled by a later pass. Layout starts in UNDEFINED — the
+    render pass transitions it on first use. Final layout (after the
+    render pass that writes it) should be SHADER_READ_ONLY_OPTIMAL so
+    the next pipeline can sample it without an extra barrier.
+
+    Differs from create_image_rgba8 (host-visible, sampled-only) in two
+    ways:
+      - Usage flags include COLOR_ATTACHMENT_BIT so the image can be a
+        framebuffer attachment
+      - Memory is DEVICE_LOCAL (GPU-only) — host can't read/write, but
+        bandwidth from the GPU's perspective is way higher. Used here
+        for intermediate render targets that never touch the CPU.
+    """
+    img_create = vk.VkImageCreateInfo(
+        sType=vk.VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+        imageType=vk.VK_IMAGE_TYPE_2D,
+        format=vk.VK_FORMAT_R8G8B8A8_UNORM,
+        extent=vk.VkExtent3D(width=width, height=height, depth=1),
+        mipLevels=1, arrayLayers=1,
+        samples=vk.VK_SAMPLE_COUNT_1_BIT,
+        tiling=vk.VK_IMAGE_TILING_OPTIMAL,
+        usage=(vk.VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT
+               | vk.VK_IMAGE_USAGE_SAMPLED_BIT),
+        sharingMode=vk.VK_SHARING_MODE_EXCLUSIVE,
+        initialLayout=vk.VK_IMAGE_LAYOUT_UNDEFINED,
+    )
+    image = vk.vkCreateImage(ctx.device, img_create, None)
+    reqs = vk.vkGetImageMemoryRequirements(ctx.device, image)
+    mem_type = find_memory_type(
+        ctx.mem_props, reqs.memoryTypeBits,
+        vk.VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
+    ai = vk.VkMemoryAllocateInfo(
+        sType=vk.VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        allocationSize=reqs.size, memoryTypeIndex=mem_type,
+    )
+    memory = vk.vkAllocateMemory(ctx.device, ai, None)
+    vk.vkBindImageMemory(ctx.device, image, memory, 0)
+
+    view_create = vk.VkImageViewCreateInfo(
+        sType=vk.VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+        image=image,
+        viewType=vk.VK_IMAGE_VIEW_TYPE_2D,
+        format=vk.VK_FORMAT_R8G8B8A8_UNORM,
+        components=vk.VkComponentMapping(
+            r=vk.VK_COMPONENT_SWIZZLE_IDENTITY,
+            g=vk.VK_COMPONENT_SWIZZLE_IDENTITY,
+            b=vk.VK_COMPONENT_SWIZZLE_IDENTITY,
+            a=vk.VK_COMPONENT_SWIZZLE_IDENTITY,
+        ),
+        subresourceRange=vk.VkImageSubresourceRange(
+            aspectMask=vk.VK_IMAGE_ASPECT_COLOR_BIT,
+            baseMipLevel=0, levelCount=1,
+            baseArrayLayer=0, layerCount=1,
+        ),
+    )
+    view = vk.vkCreateImageView(ctx.device, view_create, None)
+    return VkImage(image, memory, view,
+                    vk.VK_FORMAT_R8G8B8A8_UNORM, width, height, ctx.device)
+
+
 def create_image_rgba8(ctx, width: int, height: int) -> VkImage:
     """Create a HOST_VISIBLE RGBA8 image suitable for fragment-stage
     sampling. Layout starts in GENERAL — the host can write to it

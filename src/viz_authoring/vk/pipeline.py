@@ -21,6 +21,47 @@ import vulkan as vk
 from .shader import compile_shader
 
 
+def make_intermediate_render_pass(ctx, color_format: int):
+    """Render pass for an off-screen color target that a later pipeline
+    will SAMPLE. Differs from make_color_attachment_render_pass only in
+    finalLayout: SHADER_READ_ONLY_OPTIMAL instead of PRESENT_SRC_KHR.
+    Used for the tonemap-then-blur path where the tonemap output isn't
+    presented directly — it's input to the blur pass."""
+    color_attachment = vk.VkAttachmentDescription(
+        format=color_format,
+        samples=vk.VK_SAMPLE_COUNT_1_BIT,
+        loadOp=vk.VK_ATTACHMENT_LOAD_OP_CLEAR,
+        storeOp=vk.VK_ATTACHMENT_STORE_OP_STORE,
+        stencilLoadOp=vk.VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+        stencilStoreOp=vk.VK_ATTACHMENT_STORE_OP_DONT_CARE,
+        initialLayout=vk.VK_IMAGE_LAYOUT_UNDEFINED,
+        finalLayout=vk.VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+    )
+    color_ref = vk.VkAttachmentReference(
+        attachment=0,
+        layout=vk.VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+    )
+    subpass = vk.VkSubpassDescription(
+        pipelineBindPoint=vk.VK_PIPELINE_BIND_POINT_GRAPHICS,
+        colorAttachmentCount=1, pColorAttachments=[color_ref],
+    )
+    # Dependency at end: writes flush before the next pipeline samples.
+    dep_out = vk.VkSubpassDependency(
+        srcSubpass=0, dstSubpass=vk.VK_SUBPASS_EXTERNAL,
+        srcStageMask=vk.VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+        srcAccessMask=vk.VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+        dstStageMask=vk.VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+        dstAccessMask=vk.VK_ACCESS_SHADER_READ_BIT,
+    )
+    rp_create = vk.VkRenderPassCreateInfo(
+        sType=vk.VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
+        attachmentCount=1, pAttachments=[color_attachment],
+        subpassCount=1, pSubpasses=[subpass],
+        dependencyCount=1, pDependencies=[dep_out],
+    )
+    return vk.vkCreateRenderPass(ctx.device, rp_create, None)
+
+
 def make_color_attachment_render_pass(ctx, color_format: int):
     """Single-subpass render pass: clear → draw → present-src layout.
 
