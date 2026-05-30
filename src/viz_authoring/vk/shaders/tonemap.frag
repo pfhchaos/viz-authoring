@@ -25,23 +25,38 @@ layout(std430, binding = 1) readonly buffer MaxBuf {
 layout(set = 0, binding = 2) uniform sampler2D u_palette;
 
 layout(push_constant) uniform PushConstants {
-    int width;
-    int height;
+    // Canvas (= histogram resolution), shared across all outputs
+    int canvas_w;
+    int canvas_h;
+    // Viewport: this output's slice of the canvas in canvas pixels.
+    // Single-output / single-window: (0, 0, canvas_w, canvas_h).
+    // Multi-monitor: each output renders its rectangular slice from
+    // the same shared histogram, giving a continuous image.
+    int viewport_x;
+    int viewport_y;
+    int viewport_w;
+    int viewport_h;
     float gamma;
 };
 
 #define COLOR_SCALE 1000000u
 
 void main() {
-    // Map UV → pixel coords in the histogram. UV [0,1]^2 covers the
-    // full canvas; clamp to safe integer pixel index.
-    int px = int(v_uv.x * float(width));
-    int py = int(v_uv.y * float(height));
-    px = clamp(px, 0, width - 1);
-    py = clamp(py, 0, height - 1);
+    // Map this output's UV [0,1]^2 into its viewport slice of the
+    // full canvas. UV's origin is top-left, viewport is in canvas
+    // pixel coords, sampling reads from the shared histogram.
+    int px = viewport_x + int(v_uv.x * float(viewport_w));
+    int py = viewport_y + int(v_uv.y * float(viewport_h));
+    // Out-of-canvas → black (multi-monitor layouts where one output's
+    // viewport extends beyond the canvas bounds — render the gap as
+    // background rather than wrapping or clamping into garbage).
+    if (px < 0 || px >= canvas_w || py < 0 || py >= canvas_h) {
+        frag_color = vec4(0.0, 0.0, 0.0, 1.0);
+        return;
+    }
 
-    uint n_pixels = uint(width * height);
-    uint idx = uint(py * width + px);
+    uint n_pixels = uint(canvas_w * canvas_h);
+    uint idx = uint(py * canvas_w + px);
     uint hits  = histogram[idx];
     uint color = histogram[n_pixels + idx];
 

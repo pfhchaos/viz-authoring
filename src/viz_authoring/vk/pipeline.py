@@ -90,7 +90,15 @@ class GraphicsPipeline:
                  storage_buffers: list | None = None,
                  sampled_images: list | None = None,
                  push_constant_size: int = 0,
+                 dynamic_viewport: bool = False,
                  ):
+        # dynamic_viewport=True: viewport + scissor become dynamic state
+        # (vkCmdSetViewport / vkCmdSetScissor required per command-buffer
+        # recording). Lets one pipeline target swapchains of different
+        # sizes — multi-monitor needs this since each output's
+        # framebuffer has its own dimensions. `extent` is still used as
+        # the default at pipeline creation time but is overridden by
+        # the dynamic state at draw time.
         # sampled_images: list of (VkImage, VkSampler) tuples. Bindings
         # come after storage_buffers (so storage[0..N-1], samplers[N..]).
         # Lets fragment shaders mix SSBO data + sampled textures in
@@ -132,10 +140,27 @@ class GraphicsPipeline:
         )
         scissor = vk.VkRect2D(
             offset=vk.VkOffset2D(x=0, y=0), extent=extent)
-        viewport_state = vk.VkPipelineViewportStateCreateInfo(
-            viewportCount=1, pViewports=[viewport],
-            scissorCount=1, pScissors=[scissor],
-        )
+        if dynamic_viewport:
+            # Static state is ignored — caller will vkCmdSetViewport/
+            # vkCmdSetScissor before drawing. Pipeline still needs the
+            # counts though; values get overridden.
+            viewport_state = vk.VkPipelineViewportStateCreateInfo(
+                viewportCount=1, scissorCount=1)
+        else:
+            viewport_state = vk.VkPipelineViewportStateCreateInfo(
+                viewportCount=1, pViewports=[viewport],
+                scissorCount=1, pScissors=[scissor],
+            )
+
+        dynamic_state = None
+        if dynamic_viewport:
+            dynamic_state = vk.VkPipelineDynamicStateCreateInfo(
+                dynamicStateCount=2,
+                pDynamicStates=[
+                    vk.VK_DYNAMIC_STATE_VIEWPORT,
+                    vk.VK_DYNAMIC_STATE_SCISSOR,
+                ],
+            )
         rasterizer = vk.VkPipelineRasterizationStateCreateInfo(
             depthClampEnable=vk.VK_FALSE,
             rasterizerDiscardEnable=vk.VK_FALSE,
@@ -260,7 +285,7 @@ class GraphicsPipeline:
         )
         self.layout = vk.vkCreatePipelineLayout(ctx.device, pl_create, None)
 
-        gp_create = vk.VkGraphicsPipelineCreateInfo(
+        gp_kwargs = dict(
             stageCount=2, pStages=stages,
             pVertexInputState=vertex_input,
             pInputAssemblyState=input_assembly,
@@ -272,6 +297,9 @@ class GraphicsPipeline:
             renderPass=render_pass,
             subpass=0,
         )
+        if dynamic_state is not None:
+            gp_kwargs['pDynamicState'] = dynamic_state
+        gp_create = vk.VkGraphicsPipelineCreateInfo(**gp_kwargs)
         self.pipeline = vk.vkCreateGraphicsPipelines(
             ctx.device, vk.VK_NULL_HANDLE, 1, [gp_create], None)[0]
 

@@ -129,7 +129,8 @@ class FlameDemo:
         self.palette_sampler = create_linear_sampler(self.ctx)
 
         # Tonemap graphics pipeline — SSBOs (histogram, max_buf) + the
-        # palette sampler.
+        # palette sampler. Push constants: canvas_w/h + viewport
+        # (x/y/w/h) + gamma = 7 ints/floats = 28 bytes.
         self.tonemap = GraphicsPipeline(
             self.ctx, self.render_pass,
             SHADER_DIR / 'tonemap.vert',
@@ -137,7 +138,7 @@ class FlameDemo:
             extent=self.swapchain.extent,
             storage_buffers=[self.chaos.histogram, self.chaos.max_buf],
             sampled_images=[(self.palette_image, self.palette_sampler)],
-            push_constant_size=12,
+            push_constant_size=28,
         )
 
         self._record_command_buffers()
@@ -149,7 +150,11 @@ class FlameDemo:
 
         import cffi
         ffi = cffi.FFI()
-        push = struct.pack('2if', self.CANVAS_W, self.CANVAS_H, self.GAMMA)
+        # canvas_w, canvas_h, viewport_x, viewport_y, viewport_w, viewport_h, gamma
+        # Single-output: viewport fills the whole canvas.
+        push = struct.pack('6if', self.CANVAS_W, self.CANVAS_H,
+                            0, 0, self.CANVAS_W, self.CANVAS_H,
+                            self.GAMMA)
         pc_ptr = ffi.new('char[]', push)
 
         clear = vk.VkClearValue(

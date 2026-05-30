@@ -97,7 +97,8 @@ class LayerShellSurface:
         return list(names.values())
 
     def __init__(self, output_name: str | None = None,
-                 namespace: str = 'flame-sheep-vk'):
+                 namespace: str = 'flame-sheep-vk',
+                 install_sigint: bool = True):
         """Connect to Wayland and bind the compositor + layer-shell +
         target wl_output globals. `output_name=None` picks the first
         output the compositor advertises."""
@@ -143,8 +144,13 @@ class LayerShellSurface:
 
         # Install Ctrl+C handler — sets _closed so the main loop can exit
         # cleanly (otherwise pywayland's blocking calls don't get
-        # interrupted and the wallpaper hangs on shutdown).
-        signal.signal(signal.SIGINT, lambda *_: self._on_signal())
+        # interrupted and the wallpaper hangs on shutdown). Multi-output
+        # cases should install at the session level so all surfaces
+        # observe the close — pass install_sigint=False on the per-
+        # surface instances and the multi-output owner handles SIGINT
+        # itself.
+        if install_sigint:
+            signal.signal(signal.SIGINT, lambda *_: self._on_signal())
 
         # Per-surface state, filled in by create_surface().
         self._wl_surface = None

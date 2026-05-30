@@ -122,7 +122,7 @@ class WallpaperDemo:
             extent=self.swapchain.extent,
             storage_buffers=[self.chaos.histogram, self.chaos.max_buf],
             sampled_images=[(self.palette_image, self.palette_sampler)],
-            push_constant_size=12,
+            push_constant_size=28,
         )
         self._record_command_buffers()
         self._create_sync_objects()
@@ -134,7 +134,11 @@ class WallpaperDemo:
         ffi = cffi.FFI()
         self.command_buffers = self.ctx.allocate_command_buffers(
             len(self.swapchain.framebuffers))
-        push = struct.pack('2if', self.CANVAS_W, self.CANVAS_H, self.GAMMA)
+        # canvas_w/h + viewport_x/y/w/h + gamma. Single-output =
+        # viewport spans the whole canvas.
+        push = struct.pack('6if', self.CANVAS_W, self.CANVAS_H,
+                            0, 0, self.CANVAS_W, self.CANVAS_H,
+                            self.GAMMA)
         pc_ptr = ffi.new('char[]', push)
         clear = vk.VkClearValue(
             color=vk.VkClearColorValue(float32=[0.0, 0.0, 0.0, 1.0]))
