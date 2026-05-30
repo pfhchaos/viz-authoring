@@ -58,7 +58,8 @@ class VkImage:
         self.view = None
 
 
-def create_color_attachment_image(ctx, width: int, height: int) -> VkImage:
+def create_color_attachment_image(ctx, width: int, height: int,
+                                     extra_usage: int = 0) -> VkImage:
     """DEVICE_LOCAL RGBA8 image suitable for being a render target AND
     being sampled by a later pass. Layout starts in UNDEFINED — the
     render pass transitions it on first use. Final layout (after the
@@ -72,6 +73,10 @@ def create_color_attachment_image(ctx, width: int, height: int) -> VkImage:
       - Memory is DEVICE_LOCAL (GPU-only) — host can't read/write, but
         bandwidth from the GPU's perspective is way higher. Used here
         for intermediate render targets that never touch the CPU.
+
+    extra_usage: OR'd into the image's usage flags. Pass
+    VK_IMAGE_USAGE_TRANSFER_SRC_BIT if the caller needs to copy this
+    image to a host-visible buffer (the headless-render path does this).
     """
     img_create = vk.VkImageCreateInfo(
         sType=vk.VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
@@ -82,7 +87,8 @@ def create_color_attachment_image(ctx, width: int, height: int) -> VkImage:
         samples=vk.VK_SAMPLE_COUNT_1_BIT,
         tiling=vk.VK_IMAGE_TILING_OPTIMAL,
         usage=(vk.VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT
-               | vk.VK_IMAGE_USAGE_SAMPLED_BIT),
+               | vk.VK_IMAGE_USAGE_SAMPLED_BIT
+               | extra_usage),
         sharingMode=vk.VK_SHARING_MODE_EXCLUSIVE,
         initialLayout=vk.VK_IMAGE_LAYOUT_UNDEFINED,
     )

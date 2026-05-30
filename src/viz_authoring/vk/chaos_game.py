@@ -69,13 +69,26 @@ def _trim_variations_switch(src: str, keep_vars: frozenset) -> str:
     return _VAR_CASE_RE.sub(maybe_drop, src)
 
 
-def _make_chaos_source_transform(keep_vars: frozenset):
+def _make_chaos_source_transform(keep_vars: frozenset,
+                                    scoring_mode: bool = False):
     """Compose the symmetry-group expansion with the genome-specific
     variation-switch trim. Returned as a single source-transform
-    function (the shape ComputePipeline expects)."""
+    function (the shape ComputePipeline expects).
+
+    scoring_mode: when True, prepends `#define SCORING_MODE` so the
+    chaos shader emits per-pixel per-transform hit counts into the
+    transform_hits buffer. Wallpaper render path doesn't need this
+    (extra atomic per inner-loop iter); scoring renders do.
+    """
     def _xform(src: str) -> str:
         src = _symmetry_inject(src)
-        return _trim_variations_switch(src, keep_vars)
+        src = _trim_variations_switch(src, keep_vars)
+        if scoring_mode:
+            # Prepend AFTER the #version line — GLSL requires #version
+            # to come first.
+            lines = src.split('\n', 1)
+            src = lines[0] + '\n#define SCORING_MODE\n' + lines[1]
+        return src
     return _xform
 
 
@@ -84,7 +97,14 @@ class ChaosGame:
     genome swaps."""
 
     def __init__(self, ctx, canvas_w: int, canvas_h: int,
-                 n_walkers: int = 65536):
+                 n_walkers: int = 65536,
+                 scoring_mode: bool = False):
+        """scoring_mode: when True, compiled shaders emit per-pixel
+        per-transform hit counts into the transform_hits buffer.
+        Off by default — wallpaper render path doesn't need it and
+        avoids the extra atomic per inner-loop iter. Headless scoring
+        renders set this True so downstream metrics (cluster, symmetry,
+        balance) can read transform_hits."""
         if n_walkers % WORKGROUP_WALKERS != 0:
             raise ValueError(
                 f'n_walkers ({n_walkers}) must be divisible by '
@@ -93,6 +113,7 @@ class ChaosGame:
         self.canvas_w = canvas_w
         self.canvas_h = canvas_h
         self.n_walkers = n_walkers
+        self._scoring_mode = scoring_mode
         n_pixels = canvas_w * canvas_h
 
         # --- buffer allocation in flame_chaos.comp binding order ---
@@ -199,7 +220,8 @@ class ChaosGame:
                          self.color_speeds, self.transform_hits,
                          self.post_affines, self.pre_vars],
                 push_constant_size=40,  # see frame() for layout
-                source_transform=_make_chaos_source_transform(keep_vars),
+                source_transform=_make_chaos_source_transform(
+                    keep_vars, scoring_mode=self._scoring_mode),
                 specialization={
                     0: key[0],          # SC_n_transforms
                     1: key[1],          # SC_has_final_xform
@@ -474,6 +496,20 @@ class ChaosGame:
             self.ctx.device, self.ctx.command_pool, 1, [cb])
 
     # ----- readback -----------------------------------------------------
+
+    def download_transform_hits(self) -> np.ndarray:
+        """Returns (H, W, MAX_TRANSFORMS) uint32 — per-pixel per-transform
+        hit counts. Used by the offline scorer to compute cluster /
+        symmetry / balance metrics that need per-transform attribution."""
+        n_pixels = self.canvas_w * self.canvas_h
+        flat = self.ctx.download(self.transform_hits, np.uint32,
+                                  n_pixels * MAX_TRANSFORMS)
+        return flat.reshape(self.canvas_h, self.canvas_w, MAX_TRANSFORMS)
+
+    def clear_transform_hits(self) -> None:
+        """Zero the transform_hits buffer. Called between scoring
+        renders that need a clean per-pixel attribution map."""
+        self.ctx.zero_buffer(self.transform_hits)
 
     def download_histogram(self) -> tuple[np.ndarray, np.ndarray]:
         """Returns (hits, color_acc) — each (H, W) uint32. Both arrays
