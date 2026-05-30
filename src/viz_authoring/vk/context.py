@@ -17,9 +17,15 @@ everything; the training tools keep their own.
 """
 from __future__ import annotations
 
+import logging
+import os
+from pathlib import Path
+
 import vulkan as vk
 
 from . import buffer as _buffer
+
+log = logging.getLogger(__name__)
 
 
 # Device extensions we always request. VK_KHR_swapchain is needed for
@@ -35,9 +41,21 @@ class VkContext:
     asked to enable).
     """
 
+    # Default cache path. Putting it under XDG_CACHE_HOME means a system
+    # wipe of caches automatically clears stale data, and it doesn't
+    # pollute the user's home dir. The "vulkan" subdir gives wallpaper_ml
+    # (or other future Vulkan apps) a sibling spot to live without
+    # stepping on each other.
+    DEFAULT_PIPELINE_CACHE_PATH = (
+        Path(os.environ.get('XDG_CACHE_HOME',
+                             Path.home() / '.cache'))
+        / 'flame-sheep' / 'vulkan' / 'pipeline_cache.bin'
+    )
+
     def __init__(self, instance_extensions: list[str],
                  app_name: str = 'viz_authoring',
-                 picker=None):
+                 picker=None,
+                 pipeline_cache_path: Path | None | str = 'default'):
         """instance_extensions: list of instance extensions to enable.
         Typically includes VK_KHR_surface + a platform surface extension
         (VK_KHR_wayland_surface / VK_KHR_xlib_surface / ...).
@@ -48,12 +66,24 @@ class VkContext:
         + the required extensions. For surface-aware picking (graphics +
         present support), use VkContext.create_with_surface() after the
         surface exists.
+
+        pipeline_cache_path: where to load/save the Vulkan pipeline
+        cache. 'default' uses DEFAULT_PIPELINE_CACHE_PATH. None disables
+        the cache entirely (useful for tests or when you want a clean
+        compile every time). A Path uses that exact location.
         """
         self.instance = self._create_instance(instance_extensions, app_name)
         self.physical_device = None  # set by select_device()
         self.device = None
         self.graphics_queue = None
         self.graphics_queue_family = None
+        self.pipeline_cache = None
+        if pipeline_cache_path == 'default':
+            self._cache_path: Path | None = self.DEFAULT_PIPELINE_CACHE_PATH
+        elif pipeline_cache_path is None:
+            self._cache_path = None
+        else:
+            self._cache_path = Path(pipeline_cache_path)
         # populated by select_device():
         self._picker = picker
 
@@ -141,6 +171,7 @@ class VkContext:
             self.device_name = props.deviceName
             self._create_device()
             self._create_command_pool()
+            self._create_pipeline_cache()
             return
 
         raise RuntimeError(
@@ -190,6 +221,84 @@ class VkContext:
         )
         self.command_pool = vk.vkCreateCommandPool(
             self.device, cp_create, None)
+
+    def _create_pipeline_cache(self):
+        """Build the VkPipelineCache, seeding from the on-disk file if
+        present. The driver uses cached data to skip back-end pipeline
+        compilation — the same shader → pipeline build that takes ~ms
+        on first run drops to near-zero on subsequent runs.
+
+        Cache data is GPU/driver-version specific. The driver tags it
+        with a header that includes vendor+device IDs; if those don't
+        match, vkCreatePipelineCache silently ignores the bad data.
+        Stale-after-driver-upgrade is automatic.
+        """
+        if self._cache_path is None:
+            self.pipeline_cache = vk.VK_NULL_HANDLE
+            return
+        initial_data = b''
+        if self._cache_path.exists():
+            try:
+                initial_data = self._cache_path.read_bytes()
+                log.debug(f'loaded pipeline cache: {len(initial_data)} bytes')
+            except OSError as e:
+                log.warning(f'failed to read {self._cache_path}: {e}')
+        if initial_data:
+            # vulkan-py's high-level wrapper rejects bytes for pInitialData
+            # (expects a void* it can cast); allocate a cffi buffer with
+            # the bytes copied in and pass that as the initial data ptr.
+            data_buf = vk.ffi.new('uint8_t[]', initial_data)
+            create = vk.VkPipelineCacheCreateInfo(
+                sType=vk.VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO,
+                initialDataSize=len(initial_data),
+                pInitialData=vk.ffi.cast('void*', data_buf),
+            )
+        else:
+            create = vk.VkPipelineCacheCreateInfo(
+                sType=vk.VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO,
+                initialDataSize=0,
+            )
+        self.pipeline_cache = vk.vkCreatePipelineCache(
+            self.device, create, None)
+
+    def save_pipeline_cache(self) -> bool:
+        """Serialize the current cache to disk. Called from cleanup(),
+        but also exposed so a long-running app can checkpoint manually
+        without tearing down. Returns True on success.
+
+        vulkan-py 1.3.275's high-level binding doesn't wrap
+        vkGetPipelineCacheData; reach into vulkan.lib for the raw
+        cffi function pointer and call the loader's two-step
+        "query size, then read into buffer" protocol directly."""
+        if self._cache_path is None or self.pipeline_cache in (
+                None, vk.VK_NULL_HANDLE):
+            return False
+        try:
+            import vulkan
+            get_fn = vulkan.lib.vkGetPipelineCacheData
+            # Two-call pattern: pass a size pointer + NULL data → driver
+            # writes the required size; second call with that size gets
+            # the bytes.
+            size_p = vk.ffi.new('size_t*')
+            get_fn(self.device, self.pipeline_cache, size_p, vk.ffi.NULL)
+            size = int(size_p[0])
+            if size == 0:
+                return False
+            buf = vk.ffi.new('uint8_t[]', size)
+            get_fn(self.device, self.pipeline_cache, size_p,
+                    vk.ffi.cast('void*', buf))
+            data = bytes(vk.ffi.buffer(buf, size))
+            self._cache_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._cache_path.with_suffix(
+                self._cache_path.suffix + '.tmp')
+            tmp.write_bytes(data)
+            tmp.replace(self._cache_path)
+            log.debug(f'saved pipeline cache: {size} bytes to '
+                       f'{self._cache_path}')
+            return True
+        except Exception as e:
+            log.warning(f'failed to save pipeline cache: {e}')
+            return False
 
     # -----------------------------------------------------------------
     # Helpers commonly needed by code that builds on this context
@@ -287,6 +396,13 @@ class VkContext:
         """Destroy device + instance. Idempotent."""
         if self.device is not None:
             vk.vkDeviceWaitIdle(self.device)
+            # Save the pipeline cache to disk BEFORE destroying the
+            # cache object or device (vkGetPipelineCacheData needs both).
+            self.save_pipeline_cache()
+            if self.pipeline_cache not in (None, vk.VK_NULL_HANDLE):
+                vk.vkDestroyPipelineCache(
+                    self.device, self.pipeline_cache, None)
+                self.pipeline_cache = None
             # Auto-destroy any live buffers the caller forgot.
             for buf in getattr(self, '_live_buffers', []):
                 buf.destroy()

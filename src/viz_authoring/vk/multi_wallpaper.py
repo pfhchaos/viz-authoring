@@ -362,7 +362,16 @@ def main():
             print(name)
         return
 
-    outputs = args.outputs or LayerShellSurface.list_outputs()
+    if args.outputs:
+        outputs = args.outputs   # honor explicit order from CLI
+    else:
+        # Auto-order by physical x so the user doesn't have to figure
+        # out their compositor's advertisement order. _get_output_layout
+        # has the x positions (compositor's logical coords) already —
+        # we sort by them and the resulting list goes left-to-right.
+        from flame_sheep.rendering.surface import _get_output_layout
+        layout = _get_output_layout()
+        outputs = sorted(layout.keys(), key=lambda n: layout[n]['x'])
     print(f'rendering across {len(outputs)} output(s): {outputs}')
 
     extra = {}

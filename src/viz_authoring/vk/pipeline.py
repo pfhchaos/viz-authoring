@@ -300,8 +300,12 @@ class GraphicsPipeline:
         if dynamic_state is not None:
             gp_kwargs['pDynamicState'] = dynamic_state
         gp_create = vk.VkGraphicsPipelineCreateInfo(**gp_kwargs)
+        # Feed the context's pipeline cache so subsequent runs skip the
+        # driver-side pipeline compile. NULL_HANDLE = no caching.
+        pcache = getattr(ctx, 'pipeline_cache', vk.VK_NULL_HANDLE) \
+            or vk.VK_NULL_HANDLE
         self.pipeline = vk.vkCreateGraphicsPipelines(
-            ctx.device, vk.VK_NULL_HANDLE, 1, [gp_create], None)[0]
+            ctx.device, pcache, 1, [gp_create], None)[0]
 
         # Shader modules can be destroyed once the pipeline holds the SPIR-V.
         vk.vkDestroyShaderModule(ctx.device, vert_module, None)
@@ -436,8 +440,10 @@ class ComputePipeline:
             sType=vk.VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
             stage=stage, layout=self.layout,
         )
+        pcache = getattr(ctx, 'pipeline_cache', vk.VK_NULL_HANDLE) \
+            or vk.VK_NULL_HANDLE
         self.pipeline = vk.vkCreateComputePipelines(
-            ctx.device, vk.VK_NULL_HANDLE, 1, [cp_create], None)[0]
+            ctx.device, pcache, 1, [cp_create], None)[0]
 
         vk.vkDestroyShaderModule(ctx.device, module, None)
 
