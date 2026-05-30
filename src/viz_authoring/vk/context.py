@@ -1,19 +1,25 @@
 """VkContext — instance + physical device + logical device + queues + command pool.
 
 Long-lived state shared by everything else in the rendering stack.
-Created once per application; Surface, Swapchain, Pipeline objects
-all hold a reference to it.
+Created once per application; Surface, Swapchain, Pipeline, buffer
+allocations all hold a reference to it.
 
-Why graphics + present queues but not compute queue (for now): the
-flame renderer will need compute too, but routing wallpaper_ml's
-existing VkCompute and the new graphics path through ONE shared
-instance/device is a bigger refactor (touches wallpaper_ml's instance
-creation and lifecycle). Phase 1 keeps them separate; Phase N
-unifies if/when the duplication starts hurting.
+Supports both graphics + compute via a single queue family — Intel
+Arc and most discrete GPUs expose a queue family with both
+GRAPHICS_BIT and COMPUTE_BIT (and TRANSFER_BIT), so we don't need
+separate compute queues. The graphics_queue handles compute dispatches
+too. If a future hardware setup splits them, add a compute_queue_family
++ separate queue selection path.
+
+Separate from wallpaper_ml's VkCompute (used in standalone training
+processes). The flame renderer process uses this VkContext for
+everything; the training tools keep their own.
 """
 from __future__ import annotations
 
 import vulkan as vk
+
+from . import buffer as _buffer
 
 
 # Device extensions we always request. VK_KHR_swapchain is needed for
@@ -97,10 +103,15 @@ class VkContext:
             queue_families = vk.vkGetPhysicalDeviceQueueFamilyProperties(dev)
             graphics_idx = None
             present_idx = None
+            # We require GRAPHICS+COMPUTE in the same family — Intel/
+            # AMD/Nvidia all expose at least one such family. Saves
+            # the cross-queue synchronization complexity of running
+            # compute on a separate queue.
             for i, qf in enumerate(queue_families):
-                if qf.queueFlags & vk.VK_QUEUE_GRAPHICS_BIT:
-                    if graphics_idx is None:
-                        graphics_idx = i
+                has_graphics = bool(qf.queueFlags & vk.VK_QUEUE_GRAPHICS_BIT)
+                has_compute = bool(qf.queueFlags & vk.VK_QUEUE_COMPUTE_BIT)
+                if has_graphics and has_compute and graphics_idx is None:
+                    graphics_idx = i
                 if surface is not None:
                     supports_present = vk.ffi.new('VkBool32*')
                     get_surface_support(dev, i, surface, supports_present)
@@ -125,6 +136,7 @@ class VkContext:
             self.physical_device = dev
             self.graphics_queue_family = graphics_idx
             self.present_queue_family = present_idx
+            self.mem_props = vk.vkGetPhysicalDeviceMemoryProperties(dev)
             props = vk.vkGetPhysicalDeviceProperties(dev)
             self.device_name = props.deviceName
             self._create_device()
@@ -193,10 +205,92 @@ class VkContext:
         )
         return vk.vkAllocateCommandBuffers(self.device, alloc_info)
 
+    # ----- Buffer management (delegates to viz_authoring.vk.buffer) -----
+    #
+    # Context-aware wrappers around the pure-functional create_buffer/
+    # upload/download helpers — tracks live buffers so cleanup() can
+    # auto-destroy stragglers and so the caller doesn't have to thread
+    # the device handle through every call.
+
+    def create_buffer(self, size: int, usage: str = 'storage') -> _buffer.VkBuffer:
+        """Allocate a HOST_VISIBLE | HOST_COHERENT buffer. Tracked for
+        auto-cleanup at context teardown."""
+        if not hasattr(self, '_live_buffers'):
+            self._live_buffers = []
+        buf = _buffer.create_buffer(self.device, self.mem_props, size, usage)
+        self._live_buffers.append(buf)
+        return buf
+
+    def upload(self, buf: _buffer.VkBuffer, data) -> None:
+        _buffer.upload(self.device, buf, data)
+
+    def download(self, buf: _buffer.VkBuffer, dtype=None, count=None):
+        import numpy as np
+        if dtype is None:
+            dtype = np.float32
+        return _buffer.download(self.device, buf, dtype, count)
+
+    def zero_buffer(self, buf: _buffer.VkBuffer) -> None:
+        _buffer.zero(self.device, buf)
+
+    # ----- Compute dispatch -----
+
+    def dispatch_compute(self, pipeline, groups_x: int,
+                          groups_y: int = 1, groups_z: int = 1,
+                          push_constants: bytes | None = None):
+        """One-shot compute dispatch: record, submit, wait. Synchronous.
+
+        For per-frame command-buffer-reused patterns, build the command
+        buffer directly via allocate_command_buffers — this helper is
+        for the common "fire-and-forget compute step" case (matches
+        wallpaper_ml.VkCompute.dispatch's shape so callers can move
+        between the two)."""
+        import cffi
+        ffi = cffi.FFI()
+
+        cb = self.allocate_command_buffers(1)[0]
+        vk.vkBeginCommandBuffer(cb, vk.VkCommandBufferBeginInfo(
+            sType=vk.VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+            flags=vk.VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+        ))
+        vk.vkCmdBindPipeline(cb, vk.VK_PIPELINE_BIND_POINT_COMPUTE,
+                              pipeline.pipeline)
+        vk.vkCmdBindDescriptorSets(
+            cb, vk.VK_PIPELINE_BIND_POINT_COMPUTE,
+            pipeline.layout, 0, 1, [pipeline.descriptor_set], 0, None)
+        if push_constants is not None:
+            # vulkan-py wants a typed pointer for the push-constant
+            # blob — pass a freshly-allocated char[] + cast to void*.
+            pc_ptr = ffi.new('char[]', push_constants)
+            vk.vkCmdPushConstants(
+                cb, pipeline.layout,
+                vk.VK_SHADER_STAGE_COMPUTE_BIT,
+                0, len(push_constants),
+                ffi.cast('void*', pc_ptr))
+        vk.vkCmdDispatch(cb, groups_x, groups_y, groups_z)
+        vk.vkEndCommandBuffer(cb)
+
+        submit = vk.VkSubmitInfo(
+            sType=vk.VK_STRUCTURE_TYPE_SUBMIT_INFO,
+            commandBufferCount=1, pCommandBuffers=[cb],
+        )
+        fence = vk.vkCreateFence(
+            self.device, vk.VkFenceCreateInfo(
+                sType=vk.VK_STRUCTURE_TYPE_FENCE_CREATE_INFO), None)
+        vk.vkQueueSubmit(self.graphics_queue, 1, [submit], fence)
+        vk.vkWaitForFences(self.device, 1, [fence], vk.VK_TRUE,
+                            0xFFFFFFFFFFFFFFFF)
+        vk.vkDestroyFence(self.device, fence, None)
+        vk.vkFreeCommandBuffers(self.device, self.command_pool, 1, [cb])
+
     def cleanup(self):
         """Destroy device + instance. Idempotent."""
         if self.device is not None:
             vk.vkDeviceWaitIdle(self.device)
+            # Auto-destroy any live buffers the caller forgot.
+            for buf in getattr(self, '_live_buffers', []):
+                buf.destroy()
+            self._live_buffers = []
             if hasattr(self, 'command_pool'):
                 vk.vkDestroyCommandPool(self.device, self.command_pool, None)
             vk.vkDestroyDevice(self.device, None)
