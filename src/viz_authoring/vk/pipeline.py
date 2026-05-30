@@ -66,7 +66,20 @@ def make_color_attachment_render_pass(ctx, color_format: int):
 
 class GraphicsPipeline:
     """One graphics pipeline + its layout. Hands callers `pipeline` and
-    `layout` for command buffer recording; owns destruction."""
+    `layout` for command buffer recording; owns destruction.
+
+    Storage-buffer bindings: pass `storage_buffers=[buf0, buf1, ...]`.
+    The descriptor set layout is built with one storage-buffer binding
+    per buffer, in order (binding=0, 1, ...). The descriptor set is
+    auto-populated and exposed via self.descriptor_set for the caller
+    to vkCmdBindDescriptorSets.
+
+    Push constants: pass `push_constant_size` (bytes) — non-zero adds
+    a fragment-stage push constant range to the pipeline layout.
+
+    The triangle-demo path (no buffers, no push) still works — both
+    args default to "none."
+    """
 
     def __init__(self, ctx, render_pass,
                  vertex_shader_path: Path | str,
@@ -74,13 +87,13 @@ class GraphicsPipeline:
                  extent: 'vk.VkExtent2D',
                  topology: int = vk.VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
                  cull_mode: int = vk.VK_CULL_MODE_NONE,
-                 # No vertex buffer by default — shaders that bake their
-                 # vertices into gl_VertexIndex (like the triangle demo)
-                 # need empty vertex input. Callers with vertex buffers
-                 # will pass binding/attribute descriptions when the
-                 # first real one shows up.
+                 storage_buffers: list | None = None,
+                 push_constant_size: int = 0,
                  ):
         self.ctx = ctx
+        self.descriptor_set_layout = None
+        self.descriptor_pool = None
+        self.descriptor_set = None
         vert_spv = compile_shader(vertex_shader_path)
         frag_spv = compile_shader(fragment_shader_path)
 
@@ -142,8 +155,71 @@ class GraphicsPipeline:
             attachmentCount=1, pAttachments=[color_blend_attachment],
         )
 
+        # Optional descriptor set for storage buffers visible to the
+        # fragment stage (Phase 3 tonemap uses this).
+        set_layouts = []
+        if storage_buffers:
+            ds_bindings = [
+                vk.VkDescriptorSetLayoutBinding(
+                    binding=i,
+                    descriptorType=vk.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                    descriptorCount=1,
+                    stageFlags=vk.VK_SHADER_STAGE_FRAGMENT_BIT,
+                )
+                for i in range(len(storage_buffers))
+            ]
+            dsl_create = vk.VkDescriptorSetLayoutCreateInfo(
+                sType=vk.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+                bindingCount=len(ds_bindings), pBindings=ds_bindings,
+            )
+            self.descriptor_set_layout = vk.vkCreateDescriptorSetLayout(
+                ctx.device, dsl_create, None)
+            set_layouts = [self.descriptor_set_layout]
+
+            pool_size = vk.VkDescriptorPoolSize(
+                type=vk.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                descriptorCount=len(storage_buffers),
+            )
+            dp_create = vk.VkDescriptorPoolCreateInfo(
+                sType=vk.VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+                poolSizeCount=1, pPoolSizes=[pool_size], maxSets=1,
+            )
+            self.descriptor_pool = vk.vkCreateDescriptorPool(
+                ctx.device, dp_create, None)
+            ds_alloc = vk.VkDescriptorSetAllocateInfo(
+                sType=vk.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+                descriptorPool=self.descriptor_pool,
+                descriptorSetCount=1,
+                pSetLayouts=[self.descriptor_set_layout],
+            )
+            self.descriptor_set = vk.vkAllocateDescriptorSets(
+                ctx.device, ds_alloc)[0]
+            writes = []
+            for i, buf in enumerate(storage_buffers):
+                bi = vk.VkDescriptorBufferInfo(
+                    buffer=buf.buffer, offset=0, range=buf.size)
+                writes.append(vk.VkWriteDescriptorSet(
+                    sType=vk.VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                    dstSet=self.descriptor_set,
+                    dstBinding=i, dstArrayElement=0, descriptorCount=1,
+                    descriptorType=vk.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                    pBufferInfo=[bi],
+                ))
+            vk.vkUpdateDescriptorSets(
+                ctx.device, len(writes), writes, 0, None)
+
+        push_ranges = []
+        if push_constant_size > 0:
+            push_ranges.append(vk.VkPushConstantRange(
+                stageFlags=vk.VK_SHADER_STAGE_FRAGMENT_BIT,
+                offset=0, size=push_constant_size,
+            ))
+
         pl_create = vk.VkPipelineLayoutCreateInfo(
-            setLayoutCount=0, pushConstantRangeCount=0)
+            setLayoutCount=len(set_layouts), pSetLayouts=set_layouts,
+            pushConstantRangeCount=len(push_ranges),
+            pPushConstantRanges=push_ranges,
+        )
         self.layout = vk.vkCreatePipelineLayout(ctx.device, pl_create, None)
 
         gp_create = vk.VkGraphicsPipelineCreateInfo(
@@ -169,6 +245,12 @@ class GraphicsPipeline:
         if self.pipeline is not None:
             vk.vkDestroyPipeline(self.ctx.device, self.pipeline, None)
             vk.vkDestroyPipelineLayout(self.ctx.device, self.layout, None)
+            if self.descriptor_pool is not None:
+                vk.vkDestroyDescriptorPool(
+                    self.ctx.device, self.descriptor_pool, None)
+            if self.descriptor_set_layout is not None:
+                vk.vkDestroyDescriptorSetLayout(
+                    self.ctx.device, self.descriptor_set_layout, None)
             self.pipeline = None
             self.layout = None
 
