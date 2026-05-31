@@ -80,7 +80,19 @@ class VkContext:
         the cache entirely (useful for tests or when you want a clean
         compile every time). A Path uses that exact location.
         """
-        self.instance = self._create_instance(instance_extensions, app_name)
+        # Validation layers — opt-in via env var. Catches missing
+        # barriers, sync issues, leaks. Adds latency + log spam, so
+        # off by default; on for debugging perf-correctness bugs.
+        # FLAME_SHEEP_VK_VALIDATION=1 enables the standard validation
+        # layer; =sync also enables synchronization2-style WAR/RAW
+        # hazard checks (catches our race-condition class of bugs).
+        self._validation_mode = os.environ.get(
+            'FLAME_SHEEP_VK_VALIDATION', '').lower()
+        self.instance = self._create_instance(instance_extensions, app_name,
+                                                self._validation_mode)
+        self._debug_messenger = None
+        if self._validation_mode:
+            self._create_debug_messenger()
         self.physical_device = None  # set by select_device()
         self.device = None
         self.graphics_queue = None
@@ -97,7 +109,12 @@ class VkContext:
         self._picker = picker
 
     @staticmethod
-    def _create_instance(extensions: list[str], app_name: str):
+    def _create_instance(extensions: list[str], app_name: str,
+                          validation_mode: str = ''):
+        """validation_mode: '' (off), '1'/'true' (standard validation),
+        'sync' (standard + sync2 WAR/RAW validation — catches the
+        host↔gpu and queue-submission-order races that mask as
+        flickering / barcode artifacts)."""
         app_info = vk.VkApplicationInfo(
             sType=vk.VK_STRUCTURE_TYPE_APPLICATION_INFO,
             pApplicationName=app_name,
@@ -106,14 +123,86 @@ class VkContext:
             engineVersion=vk.VK_MAKE_VERSION(0, 1, 0),
             apiVersion=vk.VK_API_VERSION_1_0,
         )
+        layers: list[str] = []
+        exts = list(extensions)
+        pnext = None
+        if validation_mode:
+            layers.append('VK_LAYER_KHRONOS_validation')
+            if vk.VK_EXT_DEBUG_UTILS_EXTENSION_NAME not in exts:
+                exts.append(vk.VK_EXT_DEBUG_UTILS_EXTENSION_NAME)
+            if validation_mode == 'sync':
+                # SYNCVAL — flags WAR / RAW / WAW hazards across
+                # submissions. Slower than standard validation but
+                # catches exactly the bug class we just shipped two
+                # fixes for. Worth it for active debugging.
+                enables = [
+                    vk.VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT,
+                ]
+                pnext = vk.VkValidationFeaturesEXT(
+                    sType=vk.VK_STRUCTURE_TYPE_VALIDATION_FEATURES_EXT,
+                    enabledValidationFeatureCount=len(enables),
+                    pEnabledValidationFeatures=enables,
+                )
         create_info = vk.VkInstanceCreateInfo(
             sType=vk.VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
+            pNext=pnext,
             pApplicationInfo=app_info,
-            enabledExtensionCount=len(extensions),
-            ppEnabledExtensionNames=extensions,
-            enabledLayerCount=0,
+            enabledExtensionCount=len(exts),
+            ppEnabledExtensionNames=exts,
+            enabledLayerCount=len(layers),
+            ppEnabledLayerNames=layers,
         )
-        return vk.vkCreateInstance(create_info, None)
+        instance = vk.vkCreateInstance(create_info, None)
+        if validation_mode:
+            log.info(f'Vulkan validation layers enabled '
+                     f'(mode={validation_mode!r})')
+        return instance
+
+    def _create_debug_messenger(self) -> None:
+        """Attach a VK_EXT_debug_utils messenger that forwards layer
+        diagnostics to our Python logger. Only called when validation
+        is enabled. The callback runs in the calling thread (no async
+        marshalling), so log messages appear in order with the code
+        path that triggered them — important for diagnosing barriers."""
+        def _callback(severity, msg_type, callback_data, user_data):
+            try:
+                data = vk.ffi.cast(
+                    'VkDebugUtilsMessengerCallbackDataEXT*',
+                    callback_data)[0]
+                msg = vk.ffi.string(data.pMessage).decode('utf-8',
+                                                            errors='replace')
+            except Exception:
+                msg = '<could not decode validation message>'
+            sev = severity
+            if sev & vk.VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT:
+                log.error(f'[vk-validation] {msg}')
+            elif sev & vk.VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT:
+                log.warning(f'[vk-validation] {msg}')
+            elif sev & vk.VK_DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT:
+                log.debug(f'[vk-validation] {msg}')
+            else:
+                log.debug(f'[vk-validation] {msg}')
+            return vk.VK_FALSE
+        # Keep a Python reference so the FFI callback isn't gc'd.
+        self._debug_callback_ref = _callback
+        create_info = vk.VkDebugUtilsMessengerCreateInfoEXT(
+            sType=vk.VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT,
+            messageSeverity=(
+                vk.VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT
+                | vk.VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT),
+            messageType=(
+                vk.VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT
+                | vk.VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT
+                | vk.VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT),
+            pfnUserCallback=_callback,
+        )
+        fn = vk.vkGetInstanceProcAddr(
+            self.instance, 'vkCreateDebugUtilsMessengerEXT')
+        if fn is None:
+            log.warning('vkCreateDebugUtilsMessengerEXT not available; '
+                        'validation layer messages will go to stderr only')
+            return
+        self._debug_messenger = fn(self.instance, create_info, None)
 
     def select_device(self, surface: int | None = None,
                        present_queue_family: int | None = None):
@@ -439,5 +528,11 @@ class VkContext:
             vk.vkDestroyDevice(self.device, None)
             self.device = None
         if self.instance is not None:
+            if self._debug_messenger is not None:
+                fn = vk.vkGetInstanceProcAddr(
+                    self.instance, 'vkDestroyDebugUtilsMessengerEXT')
+                if fn is not None:
+                    fn(self.instance, self._debug_messenger, None)
+                self._debug_messenger = None
             vk.vkDestroyInstance(self.instance, None)
             self.instance = None
