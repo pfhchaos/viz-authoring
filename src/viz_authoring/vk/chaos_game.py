@@ -27,6 +27,7 @@ import numpy as np
 import vulkan as vk
 
 from .pipeline import ComputePipeline
+from . import pipeline_warm
 
 SHADER_DIR = Path(__file__).parent / 'shaders'
 
@@ -234,6 +235,14 @@ class ChaosGame:
                     3: self.canvas_h,   # SC_height
                 })
             self._chaos_pipes[key] = pipe
+            # Mark this key warm on disk so the wallpaper (or a future
+            # session, or a peer process) can know the Mesa shader cache
+            # has been populated and a re-create will be ~3ms instead of
+            # 200-400ms. Both wallpaper + precompile_worker go through
+            # this method, so the marker is written by whichever process
+            # compiled first.
+            pipeline_warm.mark_warm(n_transforms, has_final_xform,
+                                      keep_vars)
         return pipe
 
     # ----- genome wiring ------------------------------------------------
@@ -243,12 +252,24 @@ class ChaosGame:
                    active_vars: np.ndarray, pre_vars: np.ndarray,
                    colors: np.ndarray, weights: np.ndarray,
                    color_speeds: np.ndarray,
-                   n_transforms: int, has_final_xform: bool):
+                   n_transforms: int, has_final_xform: bool,
+                   require_warm: bool = False) -> bool:
         """Upload a genome's buffer contents.
 
         Each array must have the shape the shader expects (e.g. affines
         = (MAX_TRANSFORMS+1, 6) float32). n_transforms and
         has_final_xform are remembered for later render_frame() calls.
+
+        require_warm=True: if the (n_transforms, has_final_xform,
+        variation-set) pipeline cache key is not already in-memory AND
+        not marked warm on disk (see pipeline_warm), refuse the swap —
+        return False without uploading anything. Caller is expected to
+        enqueue a HIGH-priority precompile and retry next frame. This
+        keeps the wallpaper's render thread off cold compile paths
+        (200-400ms blocks); the visible cost is a 1-2 frame stall on
+        genome lerp that's hard to notice.
+
+        Returns True iff the genome was actually swapped in.
         """
         T = MAX_TRANSFORMS + 1
         SL = MAX_ACTIVE_VARS * SLOT_SIZE
@@ -265,6 +286,22 @@ class ChaosGame:
         _check('colors', colors, (T,))
         _check('color_speeds', color_speeds, (T,))
         _check('weights', weights, (MAX_TRANSFORMS,))
+
+        # Extract the pipeline cache key before any expensive work.
+        # If require_warm and we'd hit a cold compile, bail now.
+        var_ids_pre = np.concatenate([
+            active_vars[..., 0].ravel(),
+            pre_vars[..., 0].ravel(),
+        ])
+        keep_vars_pre = frozenset(int(v) for v in var_ids_pre if v >= 0)
+        pre_key = (int(n_transforms),
+                    1 if has_final_xform else 0,
+                    keep_vars_pre)
+        if require_warm and pre_key not in self._chaos_pipes:
+            if not pipeline_warm.is_warm(int(n_transforms),
+                                            bool(has_final_xform),
+                                            keep_vars_pre):
+                return False
 
         self.ctx.upload(self.affines, affines.astype(np.float32).ravel())
         self.ctx.upload(self.post_affines,
@@ -290,8 +327,11 @@ class ChaosGame:
         # shape + variation set. First-time use builds it (driver
         # compile + driver-side SPIR-V→ISA); subsequent set_genome()
         # calls with the same key just look up the cached pipeline.
+        # require_warm-guarded above, so reaching here means either
+        # in-memory hit or disk-warm — neither blocks for long.
         self._chaos_pipe = self._get_chaos_pipe(
             self._n_transforms, self._has_final_xform, keep_vars)
+        return True
 
     def reset_walkers(self, seed: int | None = None):
         """Random walker positions in [-1, 1]. Call after a genome swap
