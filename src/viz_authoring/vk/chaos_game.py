@@ -473,23 +473,26 @@ class ChaosGame:
         ))
 
         # In async mode, the previous frame's per-output tonemap may
-        # still be reading the histogram when this frame's clear
-        # dispatch starts writing it. Submission-order does NOT imply
+        # still be reading histogram + max_buf when this frame's
+        # writes start. Submission-order does NOT imply
         # execution-order on a Vulkan queue — that's exactly what
-        # this barrier provides: chaos's writes are deferred until
-        # any prior FRAGMENT_SHADER reads (the tonemap pipelines)
-        # have completed. In sync mode this is a no-op (the prior
-        # frame's chaos.frame() already fence-waited so no in-flight
-        # work exists).
+        # this barrier provides: chaos's writes (compute) and
+        # max_buf's fill (transfer, below) are deferred until any
+        # prior FRAGMENT_SHADER reads (the tonemap pipelines) have
+        # completed. In sync mode this is a no-op (the prior frame's
+        # chaos.frame() already fence-waited so no in-flight work
+        # exists).
         prev_reads_done = vk.VkMemoryBarrier(
             sType=vk.VK_STRUCTURE_TYPE_MEMORY_BARRIER,
             srcAccessMask=vk.VK_ACCESS_SHADER_READ_BIT,
-            dstAccessMask=vk.VK_ACCESS_SHADER_WRITE_BIT,
+            dstAccessMask=(vk.VK_ACCESS_SHADER_WRITE_BIT
+                            | vk.VK_ACCESS_TRANSFER_WRITE_BIT),
         )
         vk.vkCmdPipelineBarrier(
             cb,
             vk.VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-            vk.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            (vk.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT
+             | vk.VK_PIPELINE_STAGE_TRANSFER_BIT),
             0, 1, [prev_reads_done], 0, None, 0, None)
 
         def _bind_and_dispatch(pipeline, push_bytes, gx, gy=1, gz=1):
@@ -530,13 +533,26 @@ class ChaosGame:
                             gx=self.n_walkers // WORKGROUP_WALKERS)
         _barrier()
 
-        # 3. reduce max (also zeroes max_buf via the shader's atomicMax-
-        # against-uninitialized contract — caller is expected to zero
-        # max_buf before each render; we do it inline so the user of
-        # frame() doesn't have to remember). Note: zero_buffer is a
-        # host-side write, so it MUST happen before vkQueueSubmit —
-        # do it before recording closes.
-        self.ctx.zero_buffer(self.max_buf)
+        # 3. reduce max. The shader does atomicMax into max_buf so the
+        # buffer must be zeroed first. Use vkCmdFillBuffer (a
+        # GPU-side transfer op) instead of the previous host-side
+        # zero — host-zero races against the previous frame's tonemap
+        # still reading max_buf via FRAGMENT_SHADER (visible as torn-
+        # pixel artifacts in async mode; latent in sync mode too).
+        # Barrier after the fill so the reduce dispatch reads zeros.
+        vk.vkCmdFillBuffer(cb, self.max_buf.buffer, 0,
+                            self.max_buf.size, 0)
+        fill_to_compute = vk.VkMemoryBarrier(
+            sType=vk.VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            srcAccessMask=vk.VK_ACCESS_TRANSFER_WRITE_BIT,
+            dstAccessMask=vk.VK_ACCESS_SHADER_READ_BIT
+                            | vk.VK_ACCESS_SHADER_WRITE_BIT,
+        )
+        vk.vkCmdPipelineBarrier(
+            cb,
+            vk.VK_PIPELINE_STAGE_TRANSFER_BIT,
+            vk.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0, 1, [fill_to_compute], 0, None, 0, None)
         _bind_and_dispatch(self._reduce_pipe, reduce_push,
                             gx=(n_pixels + 255) // 256)
 
