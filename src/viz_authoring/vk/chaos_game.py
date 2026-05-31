@@ -23,11 +23,15 @@ import re
 import struct
 from pathlib import Path
 
+import logging
+
 import numpy as np
 import vulkan as vk
 
 from .pipeline import ComputePipeline
 from . import pipeline_warm
+
+log = logging.getLogger(__name__)
 
 SHADER_DIR = Path(__file__).parent / 'shaders'
 
@@ -219,6 +223,23 @@ class ChaosGame:
                keep_vars)
         pipe = self._chaos_pipes.get(key)
         if pipe is None:
+            # Log the spec-const set + variation count BEFORE compile —
+            # the spill threshold per measure_spill_threshold.py says
+            # ≤15 cases keeps SIMD8 no-spill; over that Mesa-Xe pays
+            # 1929:3326 spill/fill ops vs 0 for the untrimmed shader.
+            # If chaos perf is mysteriously slow with the warm-gate
+            # active, this tells us whether the surviving pipeline is
+            # actually narrow enough to escape spillage.
+            import time as _time
+            _t0 = _time.perf_counter()
+            sorted_vars = sorted(keep_vars)
+            log.info(
+                f'[chaos-compile] compiling pipeline: '
+                f'n_transforms={n_transforms} '
+                f'has_final={has_final_xform} '
+                f'|vars|={len(keep_vars)} '
+                f'vars={sorted_vars} '
+                f'(spill threshold ~15)')
             pipe = ComputePipeline(
                 self.ctx, SHADER_DIR / 'flame_chaos_specconst.comp',
                 buffers=[self.histogram, self.walkers, self.affines,
@@ -234,6 +255,11 @@ class ChaosGame:
                     2: self.canvas_w,   # SC_width
                     3: self.canvas_h,   # SC_height
                 })
+            compile_ms = (_time.perf_counter() - _t0) * 1000
+            log.info(
+                f'[chaos-compile] done in {compile_ms:.0f}ms '
+                f'(|vars|={len(keep_vars)}; '
+                f'{"COLD" if compile_ms > 50 else "warm-cache hit"})')
             self._chaos_pipes[key] = pipe
             # Mark this key warm on disk so the wallpaper (or a future
             # session, or a peer process) can know the Mesa shader cache
