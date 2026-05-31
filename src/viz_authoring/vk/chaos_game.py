@@ -194,6 +194,11 @@ class ChaosGame:
             push_constant_size=8)
 
         self._frame_seed = 0
+        # Async-mode resources — allocated lazily on first
+        # frame(synchronous=False) call. None for sync-only callers
+        # (bench, scoring renders).
+        self._async_cb = None
+        self._async_fence = None
 
     def _get_chaos_pipe(self, n_transforms: int, has_final_xform: int,
                           keep_vars: frozenset):
@@ -390,16 +395,29 @@ class ChaosGame:
               zoom: tuple[float, float] = (1.0, 1.0),
               rotation: float = 0.0,
               center: tuple[float, float] = (0.0, 0.0),
-              decay: float = 0.0):
+              decay: float = 0.0,
+              synchronous: bool = True):
         """Run the per-frame chaos-game cycle in a single command-buffer
         submit:
           1. clear / decay the histogram
           2. n_walkers × `iterations` chaos game steps
           3. reduce the histogram to a single max value in max_buf
         Memory barriers between dispatches make the writes from the
-        prior dispatch visible to the next. Caller doesn't need to
-        wait — the next graphics submission already does (via the
-        usual presentation semaphore + fence).
+        prior dispatch visible to the next.
+
+        synchronous=True (default): the call vkWaitForFences before
+        returning. Bench script depends on this for accurate per-call
+        timing — each invocation measures complete GPU work.
+
+        synchronous=False: submit and return immediately. The CPU is
+        at most 1 frame ahead — we wait on the PREVIOUS call's fence
+        at the START of this call (so the cb is safe to reuse).
+        Caller is responsible for ensuring anything downstream that
+        reads the histogram (e.g. tonemap pipelines) issues an
+        explicit memory barrier from COMPUTE_SHADER/SHADER_WRITE to
+        its read stage — the fence-implicit ordering goes away in
+        async mode. Async halves per-frame fence overhead and lets
+        the GPU run chaos + tonemap back-to-back.
         """
         import cffi
         import math
@@ -424,7 +442,31 @@ class ChaosGame:
         reduce_push = struct.pack('2I', n_pixels, 0)
 
         # ---- the actual command buffer ------------------------------
-        cb = self.ctx.allocate_command_buffers(1)[0]
+        # Sync: fresh cb + fence each call (caller takes the wait).
+        # Async: reuse persistent cb + fence; wait on previous frame's
+        # fence to ensure the cb is safe to overwrite.
+        if synchronous:
+            cb = self.ctx.allocate_command_buffers(1)[0]
+            fence = vk.vkCreateFence(
+                self.ctx.device, vk.VkFenceCreateInfo(
+                    sType=vk.VK_STRUCTURE_TYPE_FENCE_CREATE_INFO), None)
+        else:
+            if self._async_fence is None:
+                self._async_cb = self.ctx.allocate_command_buffers(1)[0]
+                self._async_fence = vk.vkCreateFence(
+                    self.ctx.device, vk.VkFenceCreateInfo(
+                        sType=vk.VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
+                        flags=vk.VK_FENCE_CREATE_SIGNALED_BIT),  # so first
+                                                                    # wait is
+                                                                    # a no-op
+                    None)
+            # Wait on previous frame's fence — CPU is at most 1 frame ahead.
+            vk.vkWaitForFences(self.ctx.device, 1, [self._async_fence],
+                                vk.VK_TRUE, 0xFFFFFFFFFFFFFFFF)
+            vk.vkResetFences(self.ctx.device, 1, [self._async_fence])
+            vk.vkResetCommandBuffer(self._async_cb, 0)
+            cb = self._async_cb
+            fence = self._async_fence
         vk.vkBeginCommandBuffer(cb, vk.VkCommandBufferBeginInfo(
             sType=vk.VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
             flags=vk.VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
@@ -480,20 +522,21 @@ class ChaosGame:
 
         vk.vkEndCommandBuffer(cb)
 
-        # ---- submit + wait -----------------------------------------
+        # ---- submit ------------------------------------------------
         submit = vk.VkSubmitInfo(
             sType=vk.VK_STRUCTURE_TYPE_SUBMIT_INFO,
             commandBufferCount=1, pCommandBuffers=[cb],
         )
-        fence = vk.vkCreateFence(
-            self.ctx.device, vk.VkFenceCreateInfo(
-                sType=vk.VK_STRUCTURE_TYPE_FENCE_CREATE_INFO), None)
         vk.vkQueueSubmit(self.ctx.graphics_queue, 1, [submit], fence)
-        vk.vkWaitForFences(self.ctx.device, 1, [fence], vk.VK_TRUE,
-                            0xFFFFFFFFFFFFFFFF)
-        vk.vkDestroyFence(self.ctx.device, fence, None)
-        vk.vkFreeCommandBuffers(
-            self.ctx.device, self.ctx.command_pool, 1, [cb])
+        if synchronous:
+            # Sync: wait + free this call's resources.
+            vk.vkWaitForFences(self.ctx.device, 1, [fence], vk.VK_TRUE,
+                                0xFFFFFFFFFFFFFFFF)
+            vk.vkDestroyFence(self.ctx.device, fence, None)
+            vk.vkFreeCommandBuffers(
+                self.ctx.device, self.ctx.command_pool, 1, [cb])
+        # else: async — fence will be waited on at the start of the
+        # next frame() call; cb is persistent (self._async_cb).
 
     # ----- readback -----------------------------------------------------
 
@@ -523,6 +566,17 @@ class ChaosGame:
         return hits, color_acc
 
     def cleanup(self):
+        # Wait for any in-flight async submit before destroying its
+        # fence — otherwise vkDestroyFence is undefined behavior.
+        if self._async_fence is not None:
+            vk.vkWaitForFences(self.ctx.device, 1, [self._async_fence],
+                                vk.VK_TRUE, 0xFFFFFFFFFFFFFFFF)
+            vk.vkDestroyFence(self.ctx.device, self._async_fence, None)
+            vk.vkFreeCommandBuffers(
+                self.ctx.device, self.ctx.command_pool, 1,
+                [self._async_cb])
+            self._async_fence = None
+            self._async_cb = None
         for p in (self._clear_pipe, self._de_pipe, self._reduce_pipe):
             p.cleanup()
         for p in self._chaos_pipes.values():
