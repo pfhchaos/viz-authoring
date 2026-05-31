@@ -262,14 +262,23 @@ class ChaosGame:
 
         require_warm=True: if the (n_transforms, has_final_xform,
         variation-set) pipeline cache key is not already in-memory AND
-        not marked warm on disk (see pipeline_warm), refuse the swap —
-        return False without uploading anything. Caller is expected to
-        enqueue a HIGH-priority precompile and retry next frame. This
-        keeps the wallpaper's render thread off cold compile paths
-        (200-400ms blocks); the visible cost is a 1-2 frame stall on
-        genome lerp that's hard to notice.
+        not marked warm on disk (see pipeline_warm), keep the CURRENT
+        pipeline bound — but still upload all buffer contents. Caller's
+        next render will use the previously-bound shader against the
+        new affines/colors/etc. Rotation animates correctly; if the
+        old and new variation sets differ, those frames render
+        slightly off (transforms whose variation isn't in the old
+        switch fall through to the default case) until precompile
+        warms the new key.
 
-        Returns True iff the genome was actually swapped in.
+        Why this split: render thread NEVER blocks on a cold compile
+        (200-400ms), but rotation animation continues without freezing.
+        Caller should still enqueue a precompile to get the right
+        pipeline bound on a subsequent frame.
+
+        Returns True iff the pipeline was actually swapped in (or
+        already matched the current binding). False = cold-rejected;
+        old pipeline still bound; new buffers uploaded.
         """
         T = MAX_TRANSFORMS + 1
         SL = MAX_ACTIVE_VARS * SLOT_SIZE
@@ -287,22 +296,10 @@ class ChaosGame:
         _check('color_speeds', color_speeds, (T,))
         _check('weights', weights, (MAX_TRANSFORMS,))
 
-        # Extract the pipeline cache key before any expensive work.
-        # If require_warm and we'd hit a cold compile, bail now.
-        var_ids_pre = np.concatenate([
-            active_vars[..., 0].ravel(),
-            pre_vars[..., 0].ravel(),
-        ])
-        keep_vars_pre = frozenset(int(v) for v in var_ids_pre if v >= 0)
-        pre_key = (int(n_transforms),
-                    1 if has_final_xform else 0,
-                    keep_vars_pre)
-        if require_warm and pre_key not in self._chaos_pipes:
-            if not pipeline_warm.is_warm(int(n_transforms),
-                                            bool(has_final_xform),
-                                            keep_vars_pre):
-                return False
-
+        # Buffer uploads always happen — rotation animation lives
+        # in the affine matrices (Genome.rotated() bakes phase into
+        # each transform's 2x3 affine). Skipping uploads on a cold
+        # pipeline swap would freeze rotation; we don't want that.
         self.ctx.upload(self.affines, affines.astype(np.float32).ravel())
         self.ctx.upload(self.post_affines,
                          post_affines.astype(np.float32).ravel())
@@ -323,12 +320,21 @@ class ChaosGame:
             pre_vars[..., 0].ravel(),
         ])
         keep_vars = frozenset(int(v) for v in var_ids if v >= 0)
-        # Swap in the chaos pipeline specialized for this genome's
-        # shape + variation set. First-time use builds it (driver
-        # compile + driver-side SPIR-V→ISA); subsequent set_genome()
-        # calls with the same key just look up the cached pipeline.
-        # require_warm-guarded above, so reaching here means either
-        # in-memory hit or disk-warm — neither blocks for long.
+        # Pipeline swap. If the key is already in our in-memory cache
+        # this is dict-lookup-cheap. If it's a fresh key, the cost is
+        # the SPIR-V→ISA compile (200-400ms cold, ~3ms warm via Mesa
+        # cache). require_warm=True refuses the swap when both caches
+        # would miss, keeping the render thread off cold compiles.
+        key = (self._n_transforms, self._has_final_xform, keep_vars)
+        if key in self._chaos_pipes:
+            self._chaos_pipe = self._chaos_pipes[key]
+            return True
+        if require_warm and not pipeline_warm.is_warm(
+                self._n_transforms, bool(self._has_final_xform),
+                keep_vars):
+            # Cold; keep previously-bound pipeline. Buffers already
+            # uploaded above so rotation stays alive.
+            return False
         self._chaos_pipe = self._get_chaos_pipe(
             self._n_transforms, self._has_final_xform, keep_vars)
         return True
