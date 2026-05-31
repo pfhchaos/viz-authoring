@@ -181,14 +181,16 @@ class HeadlessVkRenderer:
 
     # ----- the headless PNG snapshot path --------------------------
 
-    def snapshot_png(self, gamma: float = 6.0) -> bytes:
+    def snapshot_rgba(self, gamma: float = 6.0) -> np.ndarray:
         """Render the current histogram + palette through the tonemap
-        pipeline into an offscreen image, copy to a host buffer, encode
-        as PNG. Synchronous — submits, waits on a fence, reads back.
+        pipeline into an offscreen image, copy to a host buffer,
+        return as (H, W, 4) uint8 numpy array. Use this when you need
+        the raw pixels — snapshot_png() wraps this with PIL encode.
 
         Before calling: ensure max_buf is populated. The chaos game's
         batched frame() does that; render_frame() alone doesn't, so a
-        scoring caller should run reduce_max_hits() first.
+        scoring caller should run reduce_max_hits() first (we do this
+        unconditionally below for safety).
         """
         # The chaos game's reduce_max sequence is what populates
         # max_buf. Run it once so the tonemap sees a valid max.
@@ -275,10 +277,15 @@ class HeadlessVkRenderer:
         # count — RGBA8 = uint8, 4 channels per pixel.
         rgba = self.ctx.download(
             self._readback, np.uint8, self.width * self.height * 4)
-        rgba = rgba.reshape(self.height, self.width, 4)
+        return rgba.reshape(self.height, self.width, 4)
 
-        # PNG encode via PIL (imported lazily — keeps this module
-        # importable without PIL for callers that only use raw data).
+    def snapshot_png(self, gamma: float = 6.0) -> bytes:
+        """RGBA snapshot encoded as PNG bytes. Wraps snapshot_rgba()
+        with PIL encode. Callers wanting raw pixels should use
+        snapshot_rgba() directly."""
+        rgba = self.snapshot_rgba(gamma=gamma)
+        # PIL imported lazily — keeps this module importable without
+        # PIL for callers that only use raw data.
         from PIL import Image
         buf = io.BytesIO()
         Image.fromarray(rgba, mode='RGBA').save(buf, format='PNG')
