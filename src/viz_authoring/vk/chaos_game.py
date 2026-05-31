@@ -472,6 +472,26 @@ class ChaosGame:
             flags=vk.VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
         ))
 
+        # In async mode, the previous frame's per-output tonemap may
+        # still be reading the histogram when this frame's clear
+        # dispatch starts writing it. Submission-order does NOT imply
+        # execution-order on a Vulkan queue — that's exactly what
+        # this barrier provides: chaos's writes are deferred until
+        # any prior FRAGMENT_SHADER reads (the tonemap pipelines)
+        # have completed. In sync mode this is a no-op (the prior
+        # frame's chaos.frame() already fence-waited so no in-flight
+        # work exists).
+        prev_reads_done = vk.VkMemoryBarrier(
+            sType=vk.VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            srcAccessMask=vk.VK_ACCESS_SHADER_READ_BIT,
+            dstAccessMask=vk.VK_ACCESS_SHADER_WRITE_BIT,
+        )
+        vk.vkCmdPipelineBarrier(
+            cb,
+            vk.VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+            vk.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0, 1, [prev_reads_done], 0, None, 0, None)
+
         def _bind_and_dispatch(pipeline, push_bytes, gx, gy=1, gz=1):
             vk.vkCmdBindPipeline(cb, vk.VK_PIPELINE_BIND_POINT_COMPUTE,
                                    pipeline.pipeline)
