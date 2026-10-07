@@ -10,6 +10,8 @@ requires-python = ">=3.12"
 dependencies = [
     "numpy>=2.0",
     "moderngl>=5.0",
+    "vulkan",
+    "cffi",
 ]
 
 [project.optional-dependencies]
