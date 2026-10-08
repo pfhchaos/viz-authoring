@@ -16,6 +16,9 @@ dependencies = [
 
 [project.optional-dependencies]
 test = ["pytest>=7.0"]
+# Optional dev/debug conveniences in gpu_context: PNG snapshot (Pillow) and the
+# PyOpenGL GL fallback path. Neither is needed for normal operation.
+debug = ["Pillow", "PyOpenGL"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
