@@ -22,3 +22,8 @@ debug = ["Pillow", "PyOpenGL"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+# Generic demo/utility shaders that stayed after the flame renderer moved out
+# to flame_sheep (triangle = swapchain validation, blur = gaussian).
+viz_authoring = ["vk/shaders/*"]
