@@ -6,6 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "viz-authoring"
 version = "0.1.0"
 description = "Framework for building audio-reactive Wayland wallpaper visualizations — generic GPU/worker/load primitives extracted from flame-sheep"
+license = { text = "GPL-3.0-or-later" }
 requires-python = ">=3.12"
 dependencies = [
     "numpy>=2.0",
