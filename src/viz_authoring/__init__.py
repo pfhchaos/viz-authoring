@@ -16,12 +16,14 @@ What's here:
     workers (`is_loaded`, `sleep_if_loaded`).
   - `worker_bootstrap` — standard subprocess setup for background
     workers (logging reset, nice, SQLite connection).
+  - `response` — audio-reactive signal-shaping toolkit (EMA,
+    AsymmetricEnvelope, OnsetDensity, Delta, MelCentroid, Normalize):
+    turns raw audio-engine data into smoothed reactive visual values.
 
 What's NOT here yet (and where they live until they move):
   - Worker patterns (GpuWorker / CpuWorkerPool / ScheduledTask) — gated
     on Vulkan transition, which is the layer that gives GPU-aware
     scheduling its real primitives.
-  - Audio response/easing helpers (currently in `flame_sheep_audio.response`)
   - Wayland session/window plumbing (currently in `flame_sheep.rendering.window`)
 
 The intended consumer pattern: import primitives from `viz_authoring`,
@@ -49,6 +51,14 @@ from .load_aware import (
     sleep_if_loaded,
 )
 from .worker_bootstrap import init_worker_subprocess
+from .response import (
+    EMA,
+    AsymmetricEnvelope,
+    OnsetDensity,
+    Delta,
+    MelCentroid,
+    Normalize,
+)
 
 __all__ = [
     # GpuContext + helpers
@@ -65,4 +75,11 @@ __all__ = [
     'sleep_if_loaded',
     # worker_bootstrap
     'init_worker_subprocess',
+    # response (audio-reactive signal shaping)
+    'EMA',
+    'AsymmetricEnvelope',
+    'OnsetDensity',
+    'Delta',
+    'MelCentroid',
+    'Normalize',
 ]
